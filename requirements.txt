@@ -1,0 +1,26 @@
+# === Core dependencies ===
+sounddevice>=0.5.0
+soundfile>=0.12.0
+numpy>=1.24.0
+pyyaml>=6.0
+
+# === Audio loopback capture (meeting/video mode, captures system output) ===
+soundcard>=0.4.3
+
+# === Speech recognition (STT) ===
+# No longer local inference -- replaced by a remote TCP client connecting to the
+# SimulStreaming service (audio/stt.py); only depends on stdlib socket/json/threading
+# plus the numpy already listed above, no extra dependencies needed.
+
+# === AI / LLM ===
+httpx>=0.27.0
+
+# === Process priority optimization (Windows) ===
+psutil>=5.9.0
+
+# === Optional: text-to-speech ===
+# edge-tts>=6.0.0
+# gtts>=2.3.0
+
+# === Optional: hotkey wake ===
+# keyboard>=0.13.5

@@ -1,0 +1,52 @@
+# zAgent Q&A assist mode -- captures questions, answers with bilingual (Chinese/English) explanations
+# Listens to both the microphone (your questions) and system audio (meeting/video statements).
+# Statements are buffered into a rolling context (20 minutes by default), used as background when answering questions.
+# Run: python main.py --config config/assist.yaml  (or shorthand -c config/assist.yaml)
+
+mode: "assist"
+
+stt:
+  provider: "optimum"         # optimum | pywhispercpp | faster-whisper
+  model: "medium"             # tiny | base | small | medium | large-v3 | large-v3-turbo
+  device: "auto"              # auto | cpu | gpu
+  compute_type: "auto"
+  language: "en"              # English recognition only
+
+audio:
+  sample_rate: 16000
+  channels: 1
+  block_duration: 0.5
+  silence_threshold: 0.02        # baseline threshold, used for system-output (loopback) detection (multiplied by 0.5 internally, more sensitive)
+  mic_silence_threshold: 0.05    # separate mic threshold, raised to filter out ambient noise/breathing false triggers
+  silence_duration: 0.6          # English speech is faster-paced, so pause detection is more sensitive
+  min_record_duration: 0.5
+  max_record_duration: 7         # sliding-window cap, keeps per-inference time roughly constant (mirrors the whisper.cpp stream approach)
+  input_device: null
+  loopback_device: null          # loopback device name (soundcard speaker name), null = auto-use default speaker
+  loopback_enabled: true         # enable loopback capture (meeting/video mode)
+  mix_mode: "auto"               # auto (mic+system) | mic (mic only) | loopback (system only)
+  streaming_enabled: true        # rolling re-recognition while speaking, to catch questions/statements early
+  streaming_interval: 1.0        # rolling re-recognition interval (seconds)
+
+ai:
+  provider: "${AI_PROVIDER}"  # from .env
+  model: "${AI_MODEL}"
+  api_key: "${AI_API_KEY}"
+  api_base: "${AI_API_BASE}"
+  max_tokens: 2048
+  temperature: 0.7
+  # system_prompt is overridden by _ASSIST_SYSTEM_PROMPT in main.py (fixed bilingual output format)
+
+tts:
+  enabled: false
+  provider: "edge-tts"
+  voice: "zh-CN-XiaoxiaoNeural"
+  speed: 1.0
+
+# rolling statement context cache (time window, not turn count)
+context:
+  window_minutes: 20
+
+logging:
+  level: "INFO"
+  file: "logs/zagent-assist.log"

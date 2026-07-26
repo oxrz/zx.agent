@@ -1,0 +1,53 @@
+# zAgent transcribe mode -- pure real-time transcription of English system audio (live subtitle effect)
+# Only listens to system audio (meeting/video, the other party's speech), does not process the microphone,
+# only outputs recognized text, no Q&A.
+# Run: python main.py --config config/trans.yaml  (or shorthand -c config/trans.yaml)
+
+mode: "transcribe"
+
+stt:
+  # Remote speech recognition service (SimulStreaming + Whisper large-v3 + AlignAtt streaming decoding
+  # on a dedicated GPU server, AMD 7900XTX + ROCm 6.3 accelerated). No local model loading anymore --
+  # the client only captures/forwards/displays audio.
+  # Test finding (2026-07-23): local AMD iGPU (DirectML) inference of the medium model takes 5s+ per
+  # 8s-audio segment, making streaming effectively useless; after switching to a remote GPU server,
+  # inference time dropped to the 100-300ms range. Full migration writeup dated 2026-07-24, measured
+  # RTF < 0.06, end-to-end latency 1-2s.
+  server_host: "${STT_SERVER_HOST}"    # remote recognition service LAN address, see .env
+  server_port: "${STT_SERVER_PORT}"    # port simulstreaming_whisper_server.py listens on, see .env
+  language: "en"              # already fixed to --language en on the server side; here for documentation only
+
+audio:
+  sample_rate: 16000
+  channels: 1
+  block_duration: 0.5
+  silence_threshold: 0.02        # baseline threshold, used for system-output (loopback) detection (multiplied by 0.5 internally, more sensitive)
+  mic_silence_threshold: 0.05
+  silence_duration: 0.6          # English speech is faster-paced, so pause detection is more sensitive
+  min_record_duration: 0.5
+  # The remote SimulStreaming server has its own VAC + AlignAtt and segments on natural pauses,
+  # so the client no longer needs to force-cut at a fixed duration (the old value of 7 was meant to
+  # bound single-inference time for local inference -- keeping that limit now would send is_final=True
+  # to the server mid-sentence, interrupting its continuous decoding state and cutting sentences in half).
+  # This is only a safety net for extreme cases (server error/disconnect) to keep the buffer from
+  # growing unbounded; under normal conditions it is almost never triggered.
+  max_record_duration: 60
+  input_device: null
+  loopback_device: null          # loopback device name (soundcard speaker name), null = auto-use default speaker
+  loopback_enabled: true         # enable loopback capture (meeting/video mode)
+  mix_mode: "loopback"           # only listen to system output, ignore the microphone
+  streaming_enabled: true        # keep sending new audio to the remote service, paired with the server's AlignAtt for low-latency incremental recognition
+  streaming_interval: 1.0        # how often to send newly added audio (seconds); smaller = lower latency, slightly more network/server overhead
+
+# transcribe mode does not do Q&A, so this section is unused; kept only for field completeness
+ai:
+  provider: "${AI_PROVIDER}"
+  model: "${AI_MODEL}"
+  api_key: "${AI_API_KEY}"
+  api_base: "${AI_API_BASE}"
+  max_tokens: 1024
+  temperature: 0.3
+
+logging:
+  level: "INFO"
+  file: "logs/zagent-transcribe.log"
