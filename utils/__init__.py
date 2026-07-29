@@ -1,1 +1,1 @@
-# agent - utils module
+# agentic - utils module
