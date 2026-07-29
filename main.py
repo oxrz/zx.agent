@@ -171,14 +171,23 @@ class ZxAgent:
         No longer loads any model locally, and no longer needs _stt_lock /
         local-agreement to simulate streaming.
 
-        sources currently only configures loopback (mic-based questions are left for
-        a future version to hook up to the remote recognition service).
+        This version only supports registering a single audio source at startup; it
+        does not support connecting both mic and loopback to the remote service in
+        the same process (the server currently handles one connection at a time
+        sequentially, see whisper_server.py). Which source gets registered is decided
+        by audio.mix_mode:
+          mix_mode: "mic"      -> registers "mic" (capture_process only captures the microphone)
+          mix_mode: "loopback" -> registers "loopback" (capture_process only captures system audio)
+        If you need to transcribe meeting audio and recognize the microphone at the
+        same time, run two separate client processes with different --config files.
         """
         stt_config = self.config.get("stt", {})
         server_host = self._resolve_env_var(stt_config.get("server_host", "127.0.0.1")) or "127.0.0.1"
         server_port = self._resolve_env_var(stt_config.get("server_port", 45678)) or 45678
+        mix_mode = self.config.get("audio", {}).get("mix_mode", "loopback")
+        self._audio_source = "mic" if mix_mode == "mic" else "loopback"
         sources = {
-            "loopback": (server_host, int(server_port))
+            self._audio_source: (server_host, int(server_port))
         }
         self.stt = SpeechRecognizer(
             sources=sources,
@@ -253,8 +262,7 @@ class ZxAgent:
         )
 
     def _on_speech_end(self, source, audio_data, is_final=True):
-        """source: "mic" (what you said) | "loopback" (system output, the other party's
-        voice in a video/meeting)
+        """source: "mic" (microphone capture) | "loopback" (system output, meeting/video audio)
         is_final: True = this utterance has ended (pause/forced cut); False = a
                   mid-utterance chunk in streaming mode (the buffer is still growing).
 
@@ -264,13 +272,12 @@ class ZxAgent:
         AlignAtt natively confirms increments, so the client doesn't need to simulate
         local-agreement itself).
 
-        Filters sources by mode:
-          transcribe : only processes loopback (system output), ignores the microphone
-          assist     : processes both (mic is not yet wired to the remote recognition
-                       service in this version; kept as a placeholder)
+        Only forwards the one source registered at startup (self._audio_source,
+        decided by audio.mix_mode); the other source is ignored (under normal
+        conditions capture_process already only captures the configured source, this
+        is a second layer of protection).
         """
-        # transcribe mode only cares about system audio, mic input is skipped entirely
-        if self.mode == "transcribe" and source == "mic":
+        if source != self._audio_source:
             return
         try:
             self.stt.feed(source, audio_data, is_final)
@@ -289,7 +296,7 @@ class ZxAgent:
         transcribe mode: incremental text is printed directly, for a live-subtitle
         effect; a newline is printed on is_final.
         assist mode: the mic source is checked for questions; the loopback source is
-        buffered into the rolling context (enabled once mic is hooked up to remote recognition).
+        buffered into the rolling context.
         """
         text = result.get("text", "")
         is_final = result.get("is_final", False)
@@ -374,7 +381,9 @@ class ZxAgent:
         logger.info("agent voice assistant started")
         logger.info("=" * 50)
         names = {"transcribe": "transcribe only", "assist": "Q&A assist"}
-        print(f"\nListening... current mode: {self.mode} ({names.get(self.mode, self.mode)})")
+        source_names = {"mic": "microphone", "loopback": "system audio"}
+        source_label = source_names.get(self._audio_source, self._audio_source)
+        print(f"\nListening ({source_label})... current mode: {self.mode} ({names.get(self.mode, self.mode)})")
         print("Press Ctrl+C to exit\n")
         self.listener.start()
         try:

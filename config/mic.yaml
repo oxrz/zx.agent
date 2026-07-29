@@ -1,0 +1,69 @@
+# Microphone transcribe mode -- pure real-time transcription of English speech captured
+# from the microphone. Only listens to the microphone (e.g. you speaking, a phone call,
+# a face-to-face conversation), does not capture system audio, only outputs recognized
+# text, no Q&A (question detection belongs to assist mode, not handled here).
+# Run: python main.py --config config/mic.yaml  (or shorthand -c config/mic.yaml)
+
+mode: "transcribe"
+
+stt:
+  # Remote speech recognition service (the same dedicated GPU server running
+  # SimulStreaming + Whisper large-v3 + AlignAtt streaming decoding), connecting to
+  # the same service instance as trans.yaml. This version of the client statically
+  # registers either mic or loopback at startup (see audio.mix_mode); it does not
+  # support connecting both sources to the remote service in the same process (the
+  # server currently handles one connection at a time sequentially, see
+  # whisper_server.py). If you need to transcribe meeting audio and recognize the
+  # microphone at the same time, run two separate client processes with different
+  # --config files.
+  server_host: "${STT_SERVER_HOST}"    # remote recognition service LAN address, see .env
+  server_port: "${STT_SERVER_PORT}"    # port simulstreaming_whisper_server.py listens on, see .env
+  language: "en"              # already fixed to --language en on the server side; here for documentation only
+
+audio:
+  sample_rate: 16000
+  channels: 1
+  block_duration: 0.5
+  silence_threshold: 0.02        # baseline threshold (used by loopback; kept here only for field completeness, not effective for mic)
+  # Test finding (2026-07-27): 0.05 was too high, causing some normal-volume speech to
+  # never trigger the "speech started" detection at all (not chopped up -- never
+  # captured in the first place); measured 2-3 dropped utterances, each loss occurring
+  # in the silence gap between one utterance ending and the next starting, meaning the
+  # mic input volume never crossed the threshold. Lowered to 0.02 (close to loopback's
+  # effective threshold of silence_threshold*0.5=0.01), prioritizing the more serious
+  # "missed detection" problem, at the cost of possibly being more sensitive to ambient
+  # noise/breathing; if that causes false triggers (treating noise as speech), raise it
+  # back to somewhere between 0.03-0.04 as a compromise.
+  mic_silence_threshold: 0.02
+  # The pacing/pause pattern for mic input is unpredictable (you might speak slowly,
+  # or the other party on a call / an external audio source might speak quickly).
+  # Using loopback's aggressive 0.6s threshold would misjudge normal breathing/thinking
+  # pauses as sentence endings, causing one utterance to be cut into several segments
+  # (observed symptom: recognition results frequently getting truncated around the
+  # 2-second mark). Relaxed to 1.2s to better tolerate natural pauses and reduce
+  # premature cuts; the client-side fallback segmentation is still kept (not relying
+  # entirely on the server's VAC) -- if this still isn't ideal, it can be relaxed
+  # further to 1.5s, or the client could stop segmenting altogether and leave it
+  # entirely to the server's VAC.
+  silence_duration: 1.2
+  min_record_duration: 0.5
+  max_record_duration: 60        # the remote server has its own VAC; this is only a client-side safety net (same as trans.yaml)
+  input_device: null             # null = system default microphone, or specify a device index
+  loopback_device: null
+  loopback_enabled: false        # do not capture system audio
+  mix_mode: "mic"                # only listen to the microphone, ignore system output
+  streaming_enabled: true        # keep sending new audio to the remote service, paired with the server's AlignAtt for low-latency incremental recognition
+  streaming_interval: 1.0        # how often to send newly added audio (seconds); smaller = lower latency, slightly more network/server overhead
+
+# transcribe mode does not do Q&A, so this section is unused; kept only for field completeness
+ai:
+  provider: "${AI_PROVIDER}"
+  model: "${AI_MODEL}"
+  api_key: "${AI_API_KEY}"
+  api_base: "${AI_API_BASE}"
+  max_tokens: 1024
+  temperature: 0.3
+
+logging:
+  level: "INFO"
+  file: "logs/agent-mic.log"
