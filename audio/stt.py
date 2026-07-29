@@ -1,5 +1,5 @@
 """
-zAgent speech recognition module (remote streaming recognition client)
+Speech recognition module (remote streaming recognition client)
 
 No longer runs a model locally. Instead, connects over TCP to a remote
 SimulStreaming service (deployed on a dedicated GPU server, running Whisper

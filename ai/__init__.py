@@ -1,1 +1,1 @@
-# zAgent - ai module
+# agentic - ai module

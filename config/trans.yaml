@@ -1,4 +1,4 @@
-# zAgent transcribe mode -- pure real-time transcription of English system audio (live subtitle effect)
+# Agentic transcribe mode -- pure real-time transcription of English system audio (live subtitle effect)
 # Only listens to system audio (meeting/video, the other party's speech), does not process the microphone,
 # only outputs recognized text, no Q&A.
 # Run: python main.py --config config/trans.yaml  (or shorthand -c config/trans.yaml)
@@ -50,4 +50,4 @@ ai:
 
 logging:
   level: "INFO"
-  file: "logs/zagent-transcribe.log"
+  file: "logs/agent-trans.log"

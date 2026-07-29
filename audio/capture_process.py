@@ -1,5 +1,5 @@
 """
-zAgent audio capture subprocess
+Audio capture subprocess
 
 Runs as an independent process, responsible only for:
   - Microphone capture + VAD segmentation
@@ -309,7 +309,7 @@ class AudioCaptureProcess:
         self._process = self._ctx.Process(
             target=_capture_worker,
             args=(asdict(self.config), self._audio_out, self._log_out, self._stop_event),
-            name="zagent-audio-capture",
+            name="agent-audio-capture",
             daemon=True,
         )
         self._process.start()

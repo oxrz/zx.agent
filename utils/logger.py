@@ -1,10 +1,10 @@
 """
-zAgent logging utility
+Logging utility
 
 Logs only go to a file, never to the terminal -- the terminal is reserved for the
 recognized text / AI answers (printed via print() in main.py), so logs don't get
 mixed in with the actual transcription and make the screen hard to read.
-For debugging, open the file pointed to by log_file (default logs/zagent.log), or
+For debugging, open the file pointed to by log_file (default logs/agent.log), or
 tail -f it in real time.
 """
 
@@ -12,10 +12,10 @@ import logging
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
 
-DEFAULT_LOG_FILE = "logs/zagent.log"
+DEFAULT_LOG_FILE = "logs/agent.log"
 
 
-def setup_logger(name="zAgent", level="INFO", log_file=None, max_bytes=10485760, backup_count=3):
+def setup_logger(name="agent", level="INFO", log_file=None, max_bytes=10485760, backup_count=3):
     logger = logging.getLogger(name)
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
     if logger.handlers:

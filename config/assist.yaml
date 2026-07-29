@@ -1,4 +1,4 @@
-# zAgent Q&A assist mode -- captures questions, answers with bilingual (Chinese/English) explanations
+# Q&A assist mode -- captures questions, answers with bilingual (Chinese/English) explanations
 # Listens to both the microphone (your questions) and system audio (meeting/video statements).
 # Statements are buffered into a rolling context (20 minutes by default), used as background when answering questions.
 # Run: python main.py --config config/assist.yaml  (or shorthand -c config/assist.yaml)
@@ -49,4 +49,4 @@ context:
 
 logging:
   level: "INFO"
-  file: "logs/zagent-assist.log"
+  file: "logs/agent-assist.log"

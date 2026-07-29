@@ -1,5 +1,5 @@
 """
-zAgent text-to-speech module (optional)
+Text-to-speech module (optional)
 """
 
 import asyncio

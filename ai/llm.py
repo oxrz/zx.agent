@@ -1,5 +1,5 @@
 """
-zAgent AI / LLM invocation module
+AI / LLM invocation module
 """
 
 import json

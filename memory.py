@@ -1,5 +1,5 @@
 """
-zAgent conversation/context memory module
+conversation/context memory module
 """
 
 import time

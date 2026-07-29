@@ -1,1 +1,1 @@
-# zAgent - audio module
+# agentic - audio module

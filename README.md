@@ -1,4 +1,4 @@
-# zAgent - Real-time English Speech Recognition + Q&A Assistant
+# Real-time English Speech Recognition + Q&A Assistant
 
 > **Always-on microphone/system audio capture -> remote streaming speech recognition (English only) -> real-time text output / Q&A assistance**
 
@@ -11,8 +11,8 @@ A voice assistant for meeting/video scenarios: transcribes English speech in rea
 The program only supports two modes, **each started with its own independent config file; there is no runtime hotkey to switch between them**. If you need both modes at the same time, start two separate processes with different `--config` files:
 
 ```bash
-python main.py --config config/trans.yaml     # transcribe mode (default config)
-python main.py --config config/assist.yaml    # assist mode
+python main.py -c config/trans.yaml     # transcribe mode (default config)
+python main.py -c config/assist.yaml    # assist mode
 ```
 
 | Mode | Description |
@@ -27,7 +27,7 @@ Both modes **only recognize English** (`stt.language: "en"`) - no Chinese recogn
 ## Project Structure
 
 ```
-zAgent/
+.
 ├── main.py                    # Entry point - CLI argument parsing, module wiring, dispatching remote recognition results
 ├── config/
 │   ├── trans.yaml             # transcribe mode config
@@ -55,27 +55,27 @@ zAgent/
 ### Core Flow
 
 ```
-+------------------------------+         +---------------------------------+
-|        zAgent Client          |         |      Remote GPU Server           |
-|                                |  TCP    |                                   |
-| +-------------+  +----------+ | audio-> | +-------------------------------+ |
-| | Audio capture|->| Remote STT| +--------+->| SimulStreaming                | |
-| | mic+loopback |  | client    | | <-incr | | Whisper large-v3 + AlignAtt   | |
-| | own process  |  |(stt.py)   | | JSONL  | | automatic VAC segmentation    | |
-| +-------------+  +----+-----+ |         | +-------------------------------+ |
-|                        |       |         +-----------------------------------+
-|              +---------v--------+
-|              |  Mode dispatch    |
++--------------------------------+          +-----------------------------------+
+|              Client            |          |      Remote GPU Server            |
+|                                |  TCP     |                                   |
+| +--------------+  +----------+ | audio--> |  +------------------------------+ |
+| | Audio capture|->| Remote STT | +--------+->| SimulStreaming               | |
+| | mic+loopback |  | client     | | <-incr |  | Whisper large-v3 + AlignAtt  | |
+| | own process  |  |(stt.py)    | | JSONL  |  | automatic VAC segmentation   | |
+| +--------------+  +-----+------+ |        |  +------------------------------+ |
+|                         |        |        +-----------------------------------+
+|              +----------v--------+
+|              | Mode dispatch     |
 |              | transcribe: print |
 |              | assist: Q detect  |
-|              +--------+---------+
+|              +---------+---------+
 |                        |
-|              +---------v--------+
+|              +---------v---------+
 |              |  LLM streaming    |
-|              |  answer (bilingual,|
-|              |  with context)    |
-|              +------------------+
-+---------------------------------+
+|              |  answer with      |
+|              |  context          |
+|              +-------------------+
++----------------------------------+
 ```
 
 ### Remote Streaming Recognition
@@ -142,7 +142,7 @@ cp .env.example .env
 python main.py
 
 # assist mode
-python main.py --config config/assist.yaml
+python main.py -c config/assist.yaml
 
 # one-shot Q&A mode
 python main.py --once
@@ -172,4 +172,4 @@ Press `Ctrl+C` to shut down cleanly.
 
 ## Background
 
-zAgent targets English listening assistance for meetings/videos on Windows. Audio capture runs in its own subprocess to avoid the main process's response handling / GPU scheduling jitter causing dropped frames in the system audio loopback. After moving speech recognition from local inference to a remote GPU server, per-segment recognition time dropped from 5s+ (local DirectML inference) to the 100-300ms range, bringing end-to-end latency down to 1-2s - only then did the streaming experience become genuinely usable.
+Agentic assistance for phone-call/meetings/videos. Audio capture runs in its own subprocess to avoid the main process's response handling / GPU scheduling jitter causing dropped frames in the system audio loopback. After moving speech recognition from local inference to a remote GPU server, per-segment recognition time dropped from 5s+ (local DirectML inference) to the 100-300ms range, bringing end-to-end latency down to 1-2s - only then did the streaming experience become genuinely usable.

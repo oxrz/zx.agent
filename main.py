@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-zAgent - Voice assistant (real-time English streaming recognition + Q&A assistance)
+Voice assistant (real-time English streaming recognition + Q&A assistance)
 
 Usage:
     python main.py                            # start the voice assistant (always-on, default config/trans.yaml)
@@ -83,7 +83,7 @@ def load_env_file(env_path=None):
                 os.environ[key] = value
 
 
-class ZAgent:
+class ZxAgent:
     def __init__(self, config_path="config/trans.yaml", log_level_override=None):
         self.config = self._load_config(config_path)
         self._running = False
@@ -136,7 +136,7 @@ class ZAgent:
         logger.info("Warming up the speech recognition model...")
         self._warmup_stt()
 
-        logger.info("zAgent initialization complete")
+        logger.info("agent initialization complete")
 
     def _run_event_loop(self):
         """Entry point for the persistent event loop thread"""
@@ -371,7 +371,7 @@ class ZAgent:
         signal.signal(signal.SIGINT, self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
         logger.info("=" * 50)
-        logger.info("zAgent voice assistant started")
+        logger.info("agent voice assistant started")
         logger.info("=" * 50)
         names = {"transcribe": "transcribe only", "assist": "Q&A assist"}
         print(f"\nListening... current mode: {self.mode} ({names.get(self.mode, self.mode)})")
@@ -397,7 +397,7 @@ class ZAgent:
             self.shutdown()
 
     def shutdown(self):
-        logger.info("Shutting down zAgent...")
+        logger.info("Shutting down agent...")
         self._running = False
         self.listener.stop()
         # Close the httpx client (submitted to the persistent loop), then stop the loop
@@ -412,7 +412,7 @@ class ZAgent:
             self._loop_thread.join(timeout=3)
         except Exception:
             pass
-        logger.info("zAgent has exited")
+        logger.info("agent has exited")
 
     def _handle_signal(self, signum, frame):
         logger.info(f"Received signal {signum}, shutting down")
@@ -437,7 +437,7 @@ def main():
     # Auto-load .env from the project root on startup (see load_env_file's default path)
     load_env_file()
 
-    parser = argparse.ArgumentParser(description="zAgent - voice assistant")
+    parser = argparse.ArgumentParser(description="Agentic voice assistant")
     parser.add_argument("--config", "-c", default="config/trans.yaml", help="Path to the config file")
     parser.add_argument("--once", "-1", action="store_true", help="One-shot Q&A mode")
     parser.add_argument("--list-devices", "-l", action="store_true", help="List microphone devices")
@@ -454,7 +454,7 @@ def main():
         list_audio_devices()
         return
 
-    agent = ZAgent(config_path=args.config, log_level_override=args.log_level)
+    agent = ZxAgent(config_path=args.config, log_level_override=args.log_level)
     if args.once:
         agent.run_once()
     else:
