@@ -12,27 +12,22 @@ stt:
   compute_type: "auto"
   language: "en"              # English recognition only
 
+# Fields identical across all modes (sample_rate/channels/block_duration/
+# min_record_duration/streaming_enabled/streaming_interval, ai.provider/model/
+# api_key/api_base, logging.level, the whole display block) now live in
+# config/common.yaml and are deep-merged in automatically -- only the fields
+# that actually differ for assist mode are listed below.
 audio:
-  sample_rate: 16000
-  channels: 1
-  block_duration: 0.5
   silence_threshold: 0.02        # baseline threshold, used for system-output (loopback) detection (multiplied by 0.5 internally, more sensitive)
   mic_silence_threshold: 0.05    # separate mic threshold, raised to filter out ambient noise/breathing false triggers
   silence_duration: 0.6          # English speech is faster-paced, so pause detection is more sensitive
-  min_record_duration: 0.5
   max_record_duration: 7         # sliding-window cap, keeps per-inference time roughly constant (mirrors the whisper.cpp stream approach)
   input_device: null
   loopback_device: null          # loopback device name (soundcard speaker name), null = auto-use default speaker
   loopback_enabled: true         # enable loopback capture (meeting/video mode)
   mix_mode: "auto"               # auto (mic+system) | mic (mic only) | loopback (system only)
-  streaming_enabled: true        # rolling re-recognition while speaking, to catch questions/statements early
-  streaming_interval: 1.0        # rolling re-recognition interval (seconds)
 
 ai:
-  provider: "${AI_PROVIDER}"  # from .env
-  model: "${AI_MODEL}"
-  api_key: "${AI_API_KEY}"
-  api_base: "${AI_API_BASE}"
   max_tokens: 2048
   temperature: 0.7
   # system_prompt is overridden by _ASSIST_SYSTEM_PROMPT in main.py (fixed bilingual output format)
@@ -48,5 +43,4 @@ context:
   window_minutes: 20
 
 logging:
-  level: "INFO"
   file: "logs/agent-assist.log"

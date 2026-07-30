@@ -24,3 +24,6 @@ psutil>=5.9.0
 
 # === Optional: hotkey wake ===
 # keyboard>=0.13.5
+
+# === Optional: transparent overlay GUI (gui/app.py) ===
+PyQt6==6.10.2                # cross-platform GUI toolkit, only needed to run `python -m gui.app`
