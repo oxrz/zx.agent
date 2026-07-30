@@ -36,7 +36,7 @@ from audio.stt import SpeechRecognizer
 from audio.tts import TextToSpeech
 from ai.llm import LLMClient, LLMConfig
 from memory import ContextBuffer
-from display.publisher import DisplayPublisher
+from gui.publisher import DisplayPublisher
 
 
 def set_high_performance():
