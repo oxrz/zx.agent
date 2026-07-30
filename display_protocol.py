@@ -14,7 +14,7 @@ Roles:
   - The GUI process (gui/) is the TCP **server**: it only passively listens and
     renders. It has no knowledge of, and does not care, whether the data comes
     from the Python agent or a future Go agent.
-  - The agent core logic (main.py, via display/publisher.py) is the TCP
+  - The agent core logic (main.py, via gui/publisher.py) is the TCP
     **client**: it connects to the GUI and pushes events. If the GUI isn't
     running, connection failures are swallowed silently -- the original
     CLI-only behavior (printing to the terminal) is unaffected, and no

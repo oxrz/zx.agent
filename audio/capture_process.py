@@ -239,16 +239,38 @@ def _capture_worker(config_dict: dict, audio_out: mp.Queue, log_out: mp.Queue, s
         log("info", "🎤 Listening on microphone")
 
     mic_stream = None
-    try:
-        mic_stream = sd.InputStream(
-            device=cfg.input_device,
-            channels=cfg.channels,
-            samplerate=cfg.sample_rate,
-            blocksize=int(cfg.sample_rate * cfg.block_duration),
-            callback=mic_callback,
-        )
-        mic_stream.start()
+    # Only open the microphone stream when it's actually needed -- mix_mode
+    # "loopback" explicitly means "system audio only, ignore the microphone",
+    # so opening it there just adds a failure point for zero benefit. This
+    # also matters because a failing microphone device (disconnected
+    # bluetooth headset mic, stale device index after a driver update, etc.)
+    # must not be able to bring down the whole capture process -- previously
+    # any exception here escaped to the outer try/except and killed BOTH
+    # sources (including a loopback thread that was already running fine),
+    # which is exactly the silent-failure mode that made loopback-only
+    # transcribe mode stop working entirely whenever the mic was unavailable.
+    if cfg.mix_mode in ("mic", "auto"):
+        try:
+            mic_stream = sd.InputStream(
+                device=cfg.input_device,
+                channels=cfg.channels,
+                samplerate=cfg.sample_rate,
+                blocksize=int(cfg.sample_rate * cfg.block_duration),
+                callback=mic_callback,
+            )
+            mic_stream.start()
+        except Exception as e:
+            mic_stream = None
+            log(
+                "warning",
+                f"Failed to open the microphone (mix_mode={cfg.mix_mode!r}): {e}. "
+                f"Continuing without microphone input" + (
+                    " -- loopback (system audio) capture is unaffected."
+                    if cfg.loopback_enabled else "."
+                ),
+            )
 
+    try:
         while not stop_event.is_set():
             try:
                 source, block = audio_queue.get(timeout=0.1)

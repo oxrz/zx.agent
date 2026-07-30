@@ -33,5 +33,8 @@ display:
   enabled: false
   host: "127.0.0.1"
   port: 8765
-  width: 900   # overlay window width in pixels
-  height: 400   # overlay window height in pixels 
+  width: 900     # overlay window width in pixels
+  height: 400    # overlay window height in pixels
+  opacity: 140    # background panel opacity, 0-255 (also adjustable live via the Settings window)
+  theme: "dark"   # "dark" (black background, white text) | "light" (white background, black text);
+                  # also switchable live via the Settings window (right-click the overlay)

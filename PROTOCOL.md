@@ -16,7 +16,7 @@ versa.
   independently of the agent core, and the agent core does not need to know
   or care whether a GUI is even running. If the connection fails, the agent
   core silently drops display events and continues operating exactly as it
-  does today (CLI-only output) -- see `display/publisher.py`.
+  does today (CLI-only output) -- see `gui/publisher.py`.
 - No authentication, no TLS. Only bind to `127.0.0.1` unless you understand
   the risk of exposing this on a wider network.
 
