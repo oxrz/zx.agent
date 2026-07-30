@@ -1,0 +1,37 @@
+# Shared config across all agentic modes (trans.yaml / assist.yaml / mic.yaml).
+# Loaded first by ZxAgent._load_config; each mode's own yaml is deep-merged on
+# top of this and wins on any key conflict (dict values merge key-by-key,
+# recursively; non-dict values -- including lists -- are replaced outright).
+#
+# Only fields identical across all three mode configs belong here. Don't move
+# a field here "for tidiness" if a mode file would immediately need to
+# override it again -- that just adds a layer of indirection with no payoff.
+# `stt`, mode-specific `audio` tuning (silence thresholds, mix_mode,
+# max_record_duration, loopback settings), `ai.max_tokens`/`temperature`,
+# `context`, `tts`, and `logging.file` all differ per mode and stay in each
+# mode's own yaml.
+
+ai:
+  provider: "${AI_PROVIDER}"
+  model: "${AI_MODEL}"
+  api_key: "${AI_API_KEY}"
+  api_base: "${AI_API_BASE}"
+
+audio:
+  sample_rate: 16000
+  channels: 1
+  block_duration: 0.5
+  min_record_duration: 0.5
+  streaming_enabled: true        # keep sending new audio to the remote service, paired with the server's AlignAtt for low-latency incremental recognition
+  streaming_interval: 1.0        # how often to send newly added audio (seconds); smaller = lower latency, slightly more network/server overhead
+
+logging:
+  level: "INFO"
+
+# optional transparent overlay GUI (gui/app.py), disabled by default -- see PROTOCOL.md
+display:
+  enabled: false
+  host: "127.0.0.1"
+  port: 8765
+  width: 900   # overlay window width in pixels
+  height: 400   # overlay window height in pixels 

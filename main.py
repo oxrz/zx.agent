@@ -20,9 +20,11 @@ different --config files, e.g. config/trans.yaml / config/assist.yaml):
 import os
 import sys
 import time
+import socket
 import asyncio
 import argparse
 import signal
+import subprocess
 import threading
 import platform
 from pathlib import Path
@@ -34,6 +36,7 @@ from audio.stt import SpeechRecognizer
 from audio.tts import TextToSpeech
 from ai.llm import LLMClient, LLMConfig
 from memory import ContextBuffer
+from display.publisher import DisplayPublisher
 
 
 def set_high_performance():
@@ -84,9 +87,18 @@ def load_env_file(env_path=None):
 
 
 class ZxAgent:
-    def __init__(self, config_path="config/trans.yaml", log_level_override=None):
+    def __init__(self, config_path="config/trans.yaml", log_level_override=None,
+                 gui_override=None, gui_auto_launch=False):
         self.config = self._load_config(config_path)
         self._running = False
+        # The CLI's --gui/-g takes priority over the config file's display.enabled,
+        # same override pattern as --log-level -- lets you turn the overlay on/off
+        # per-run without editing the yaml. None = defer to the config file.
+        self._gui_override = gui_override
+        # When True (only set by --gui/-g), also spawn `python -m gui.app` as a
+        # child process if nothing is already listening, so a single command
+        # starts both the agent and the overlay window.
+        self._gui_auto_launch = gui_auto_launch
 
         # The CLI's --log-level/-v takes priority over the config file's logging.level,
         # for quick ad-hoc debugging (e.g. to see how often partials get skipped /
@@ -125,11 +137,21 @@ class ZxAgent:
         # early because an incremental result ended in a question mark, so we don't
         # trigger it again once the utterance ends (is_final).
         self._question_fired = {"mic": False, "loopback": False}
+        # Per-source running text for the utterance currently in progress. The
+        # remote recognition service sends `text` as an incremental delta on
+        # every update (see audio/stt.py's docstring), not the full sentence
+        # accumulated so far -- printing deltas back-to-back to the terminal
+        # happens to reconstruct the sentence visually, but anything that needs
+        # the *whole* current sentence (the GUI display, the LLM question text,
+        # the rolling context) needs it concatenated here first. Reset to ""
+        # whenever is_final=True closes out an utterance.
+        self._transcript_accum = {"mic": "", "loopback": ""}
 
         self._init_stt()
         self._init_llm()
         self._init_tts()
         self._init_context()
+        self._init_display()
         self._init_listener()
 
         # Warm up the STT model
@@ -150,14 +172,47 @@ class ZxAgent:
         logger.info("Remote speech recognition client started (connecting in the background)")
 
     def _load_config(self, config_path):
+        """Load the mode-specific config file, deep-merged on top of
+        config/common.yaml (fields shared across all modes -- audio capture
+        basics, ai provider/model/api_base/api_key, logging.level, the
+        display block). The mode file always wins on any key conflict; only
+        add a field to common.yaml if it's genuinely identical across every
+        mode config, otherwise leave it in the mode file where it belongs.
+
+        common.yaml is optional -- if it's missing (e.g. a stripped-down
+        deployment, or someone deleted it), the mode file is used as-is with
+        a warning, so this isn't a hard dependency."""
+        common_file = Path(config_path).resolve().parent / "common.yaml"
+        common_config = {}
+        if common_file.exists():
+            with open(common_file, "r", encoding="utf-8") as f:
+                common_config = yaml.safe_load(f) or {}
+        else:
+            logger.warning(f"{common_file} not found, skipping common config merge")
+
         config_file = Path(config_path)
         if not config_file.exists():
             logger.warning(f"Config file not found: {config_path}, using default config")
-            return {}
+            return common_config
         with open(config_file, "r", encoding="utf-8") as f:
-            config = yaml.safe_load(f) or {}
-        logger.info(f"Config file loaded: {config_path}")
-        return config
+            mode_config = yaml.safe_load(f) or {}
+        logger.info(f"Config file loaded: {config_path} (merged with {common_file.name})")
+        return self._deep_merge(common_config, mode_config)
+
+    @staticmethod
+    def _deep_merge(base: dict, override: dict) -> dict:
+        """Recursively merge `override` into `base`, returning a new dict.
+        Nested dicts are merged key-by-key; any other value type (including
+        lists) is replaced outright by `override`'s value -- lists aren't
+        concatenated, since silently merging list contents from two files
+        would be surprising and hard to reason about."""
+        merged = dict(base)
+        for key, value in override.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = ZxAgent._deep_merge(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
 
     def _resolve_env_var(self, value):
         if isinstance(value, str) and value.startswith("${") and value.endswith("}"):
@@ -235,6 +290,70 @@ class ZxAgent:
         window_minutes = context_config.get("window_minutes", 20)
         self.context = ContextBuffer(window_seconds=window_minutes * 60)
 
+    def _init_display(self):
+        """Optional display frontend publisher (e.g. the PyQt transparent overlay
+        in gui/). Disabled by default -- costs nothing and changes no behavior
+        unless display.enabled: true is set in the config. The agent core never
+        imports PyQt or anything GUI-related directly; it only talks to
+        DisplayPublisher's tiny API (transcript/answer_chunk/status/clear), which
+        is a silent no-op whenever the display frontend isn't running. This keeps
+        the agent core swappable for a rewrite in another language (e.g. Go)
+        without touching the GUI at all -- only display_protocol.py's wire format
+        needs to be respected."""
+        display_config = self.config.get("display", {})
+        enabled = display_config.get("enabled", False)
+        if self._gui_override is not None:
+            enabled = self._gui_override
+        host = display_config.get("host", "127.0.0.1")
+        port = display_config.get("port", 8765)
+
+        self._gui_process = None
+        if enabled and self._gui_auto_launch:
+            width = display_config.get("width")
+            height = display_config.get("height")
+            self._gui_process = self._maybe_launch_gui(host, port, width, height)
+
+        self.display = DisplayPublisher(
+            enabled=enabled,
+            host=host,
+            port=port,
+            logger=logger,
+        )
+
+    def _maybe_launch_gui(self, host, port, width=None, height=None):
+        """Launch `python -m gui.app` as a child process, unless something is
+        already listening on host:port (e.g. the user started the GUI manually
+        in another terminal -- don't spawn a second, redundant overlay window).
+        Only called when --gui/-g requested auto-launch; the agent core still
+        never imports anything from gui/ or PyQt directly -- it just shells out
+        to a separate `python -m gui.app` process, same as running it by hand.
+
+        width/height (optional, from config.display.width/height) are forwarded
+        as --width/--height so the auto-launched window matches whatever size
+        was configured, instead of always falling back to gui.app's built-in
+        default."""
+        probe_host = "127.0.0.1" if host in ("0.0.0.0", "") else host
+        try:
+            with socket.create_connection((probe_host, port), timeout=0.3):
+                logger.info(f"GUI already listening on {probe_host}:{port}, not launching a new one")
+                return None
+        except OSError:
+            pass  # nothing listening yet -- go ahead and launch it
+
+        cmd = [sys.executable, "-m", "gui.app", "--host", str(host), "--port", str(port)]
+        if width:
+            cmd += ["--width", str(width)]
+        if height:
+            cmd += ["--height", str(height)]
+
+        try:
+            proc = subprocess.Popen(cmd, cwd=str(Path(__file__).resolve().parent))
+            logger.info(f"Launched GUI overlay (pid={proc.pid})")
+            return proc
+        except Exception as e:
+            logger.warning(f"Failed to auto-launch GUI overlay: {e}")
+            return None
+
     def _init_listener(self):
         audio_config = self.config.get("audio", {})
         capture_config = CaptureConfig(
@@ -298,28 +417,40 @@ class ZxAgent:
         assist mode: the mic source is checked for questions; the loopback source is
         buffered into the rolling context.
         """
-        text = result.get("text", "")
+        delta = result.get("text", "")
         is_final = result.get("is_final", False)
 
+        # `delta` is only the newly confirmed increment for this update (see
+        # audio/stt.py) -- accumulate it into the running sentence for this
+        # source so anything downstream (GUI, LLM, context) sees the full
+        # current sentence, not a fragment.
+        if delta:
+            self._transcript_accum[source] += delta
+        full_text = self._transcript_accum[source]
+
         if self.mode == "transcribe":
-            if text:
-                print(text, end="", flush=True)
+            if delta:
+                print(delta, end="", flush=True)
+                self.display.transcript(full_text, source, is_final)
             if is_final:
                 print(flush=True)
+                self._transcript_accum[source] = ""
             return
 
         # assist mode
-        if text:
+        if delta:
+            self.display.transcript(full_text, source, is_final)
             if source == "mic":
-                if not self._question_fired[source] and text.strip().endswith("?"):
+                if not self._question_fired[source] and full_text.strip().endswith("?"):
                     self._question_fired[source] = True
-                    logger.info(f"Question detected: {text}")
-                    self._ask_assist(text)
-            elif source == "loopback":
-                self.context.add(text, source="loopback")
+                    logger.info(f"Question detected: {full_text}")
+                    self._ask_assist(full_text)
 
         if is_final:
+            if source == "loopback" and full_text:
+                self.context.add(full_text, source="loopback")
             self._question_fired[source] = False
+            self._transcript_accum[source] = ""
 
     def _ask_assist(self, question):
         """Ask the LLM: include the rolling context as background, output a bilingual (Chinese/English) answer"""
@@ -336,7 +467,10 @@ class ZxAgent:
         ]
         logger.info("AI analyzing...")
         print("\n💡 ", end="", flush=True)
+        self.display.clear("answer")
+        self.display.status("thinking")
         self._run_stream(self.llm.chat(messages, stream=True))
+        self.display.status("listening")
 
     _ASSIST_SYSTEM_PROMPT = (
         "You are a real-time assistive thinking helper. The user is in a meeting/watching a video/"
@@ -362,7 +496,9 @@ class ZxAgent:
             async for chunk in async_gen:
                 chunks.append(chunk)
                 print(chunk, end="", flush=True)
+                self.display.answer_chunk(chunk)
             print()
+            self.display.answer_chunk("", done=True)
 
         future = asyncio.run_coroutine_threadsafe(consume(), self._loop)
         try:
@@ -409,6 +545,13 @@ class ZxAgent:
         logger.info("Shutting down agent...")
         self._running = False
         self.listener.stop()
+        self.display.close()
+        if self._gui_process is not None:
+            try:
+                self._gui_process.terminate()
+                self._gui_process.wait(timeout=3)
+            except Exception:
+                pass
         # Close the httpx client (submitted to the persistent loop), then stop the loop
         try:
             if self._loop.is_running():
@@ -451,6 +594,14 @@ def main():
     parser.add_argument("--once", "-1", action="store_true", help="One-shot Q&A mode")
     parser.add_argument("--list-devices", "-l", action="store_true", help="List microphone devices")
     parser.add_argument(
+        "--gui", "-g",
+        action="store_true",
+        help="Enable the transparent overlay GUI display (overrides display.enabled "
+             "in the config file). Also auto-launches `python -m gui.app` as a "
+             "child process if nothing is already listening on the configured "
+             "host:port, so a single command starts both -- no need to run it separately.",
+    )
+    parser.add_argument(
         "--log-level", "-v",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         default=None,
@@ -463,7 +614,12 @@ def main():
         list_audio_devices()
         return
 
-    agent = ZxAgent(config_path=args.config, log_level_override=args.log_level)
+    agent = ZxAgent(
+        config_path=args.config,
+        log_level_override=args.log_level,
+        gui_override=(True if args.gui else None),
+        gui_auto_launch=args.gui,
+    )
     if args.once:
         agent.run_once()
     else:
