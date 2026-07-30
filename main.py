@@ -36,7 +36,18 @@ from audio.stt import SpeechRecognizer
 from audio.tts import TextToSpeech
 from ai.llm import LLMClient, LLMConfig
 from memory import ContextBuffer
-from display.publisher import DisplayPublisher
+from gui.publisher import DisplayPublisher
+
+# Env var set on the GUI subprocess we spawn (see _maybe_launch_gui) so
+# gui/app.py can tell "launched by this agent" apart from "run directly by
+# hand" and refuse the latter -- --gui/-g is meant to be the only entry
+# point, since agent and GUI are now a paired session (see the GUI-process
+# monitor in run()/run_once()/shutdown()). Must match the identical literal
+# in gui/app.py -- kept as a plain duplicated string rather than a shared
+# import, since importing anything from gui/app.py would pull in PyQt6 at
+# module load time, which the agent core must never depend on, even
+# indirectly.
+_GUI_LAUNCH_TOKEN_ENV = "AGENTIC_GUI_LAUNCH_TOKEN"
 
 
 def set_high_performance():
@@ -311,7 +322,9 @@ class ZxAgent:
         if enabled and self._gui_auto_launch:
             width = display_config.get("width")
             height = display_config.get("height")
-            self._gui_process = self._maybe_launch_gui(host, port, width, height)
+            opacity = display_config.get("opacity")
+            theme = display_config.get("theme")
+            self._gui_process = self._maybe_launch_gui(host, port, width, height, opacity, theme)
 
         self.display = DisplayPublisher(
             enabled=enabled,
@@ -320,7 +333,7 @@ class ZxAgent:
             logger=logger,
         )
 
-    def _maybe_launch_gui(self, host, port, width=None, height=None):
+    def _maybe_launch_gui(self, host, port, width=None, height=None, opacity=None, theme=None):
         """Launch `python -m gui.app` as a child process, unless something is
         already listening on host:port (e.g. the user started the GUI manually
         in another terminal -- don't spawn a second, redundant overlay window).
@@ -328,10 +341,13 @@ class ZxAgent:
         never imports anything from gui/ or PyQt directly -- it just shells out
         to a separate `python -m gui.app` process, same as running it by hand.
 
-        width/height (optional, from config.display.width/height) are forwarded
-        as --width/--height so the auto-launched window matches whatever size
-        was configured, instead of always falling back to gui.app's built-in
-        default."""
+        width/height/opacity/theme (optional, from config.display.*) are
+        forwarded as the matching --flag so the auto-launched window starts
+        with whatever was configured, instead of always falling back to
+        gui.app's built-in defaults. All four are also adjustable live from
+        the GUI's own Settings window (right-click the overlay) regardless of
+        what they started as -- these config values only set the initial
+        state at launch."""
         probe_host = "127.0.0.1" if host in ("0.0.0.0", "") else host
         try:
             with socket.create_connection((probe_host, port), timeout=0.3):
@@ -345,14 +361,45 @@ class ZxAgent:
             cmd += ["--width", str(width)]
         if height:
             cmd += ["--height", str(height)]
+        if opacity is not None:
+            cmd += ["--opacity", str(opacity)]
+        if theme:
+            cmd += ["--theme", str(theme)]
+
+        env = dict(os.environ)
+        env[_GUI_LAUNCH_TOKEN_ENV] = "1"
 
         try:
-            proc = subprocess.Popen(cmd, cwd=str(Path(__file__).resolve().parent))
+            proc = subprocess.Popen(cmd, cwd=str(Path(__file__).resolve().parent), env=env)
             logger.info(f"Launched GUI overlay (pid={proc.pid})")
+            self._start_gui_monitor(proc)
             return proc
         except Exception as e:
             logger.warning(f"Failed to auto-launch GUI overlay: {e}")
             return None
+
+    def _start_gui_monitor(self, proc):
+        """Since --gui/-g explicitly asked to pair the agent with a GUI
+        overlay it launched itself, treat that pairing as a real session:
+        if the GUI process exits for any reason (Quit from its tray menu,
+        the window being killed, a crash), the agent shuts itself down too,
+        rather than continuing to run headless with no display and no way
+        to bring one back short of restarting the agent.
+
+        Polling in a plain daemon thread rather than a signal/callback,
+        since subprocess.Popen doesn't offer an exit notification and this
+        only needs to react within a second or so, not instantly."""
+        def _watch():
+            proc.wait()  # blocks until the GUI process exits, however it exits
+            if self._running:
+                logger.info(
+                    f"GUI overlay (pid={proc.pid}) exited -- shutting down the "
+                    f"agent too, since it was launched paired via --gui/-g"
+                )
+                self._running = False
+
+        thread = threading.Thread(target=_watch, daemon=True, name="gui-monitor")
+        thread.start()
 
     def _init_listener(self):
         audio_config = self.config.get("audio", {})
@@ -532,10 +579,16 @@ class ZxAgent:
 
     def run_once(self):
         logger.info("One-shot Q&A mode, please speak...")
+        self._running = True
         self.listener.start()
         try:
-            # The model is already warmed up, 30 seconds is enough
-            time.sleep(30)
+            # The model is already warmed up, 30 seconds is enough. Polling
+            # self._running in small increments (rather than one flat sleep(30))
+            # so a paired GUI overlay exiting (see _start_gui_monitor) can end
+            # this early too, same as it does for run().
+            deadline = time.time() + 30
+            while self._running and time.time() < deadline:
+                time.sleep(0.5)
         except KeyboardInterrupt:
             pass
         finally:
@@ -599,7 +652,11 @@ def main():
         help="Enable the transparent overlay GUI display (overrides display.enabled "
              "in the config file). Also auto-launches `python -m gui.app` as a "
              "child process if nothing is already listening on the configured "
-             "host:port, so a single command starts both -- no need to run it separately.",
+             "host:port, so a single command starts both. The two are paired for "
+             "the rest of the session: closing the GUI (Quit from its tray icon, "
+             "or the window being killed) shuts this agent process down too, and "
+             "vice versa. gui.app also refuses to run standalone by hand -- --gui/-g "
+             "on this command is the only supported way to start it.",
     )
     parser.add_argument(
         "--log-level", "-v",

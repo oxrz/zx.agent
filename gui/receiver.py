@@ -1,6 +1,6 @@
 """
 DisplayReceiver -- the GUI-side TCP server. Listens for connections from the
-agent core (display/publisher.py) and turns each incoming JSONL message into
+agent core (gui/publisher.py) and turns each incoming JSONL message into
 a Qt signal, so the rest of the GUI never has to know about sockets at all.
 
 Runs its own accept-loop in a background thread (not the Qt main thread --
