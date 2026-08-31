@@ -23,7 +23,42 @@ audio:
   block_duration: 0.5
   min_record_duration: 0.5
   streaming_enabled: true        # keep sending new audio to the remote service, paired with the server's AlignAtt for low-latency incremental recognition
-  streaming_interval: 1.0        # how often to send newly added audio (seconds); smaller = lower latency, slightly more network/server overhead
+  # How often to send newly added audio, in seconds. Two constraints make this
+  # value non-obvious, and both were measured (2026-08-20 baseline, 68s of audio;
+  # the fix was then verified on a 162s run, 2026-08-21):
+  #
+  # 1. The emit check runs once per captured block (process_block in
+  #    audio/capture_process.py), so the achievable cadence is quantized to
+  #    block_duration. At 1.0 with block_duration 0.5 the check at T+1.0 lands
+  #    just under the threshold on most blocks and only fires at T+1.5 -- 37 of
+  #    46 sends came out at 1.5s rather than the intended 1.0s. Keeping this
+  #    strictly below a multiple of block_duration avoids sitting on that edge.
+  #    Verified: at 0.9, 155 of 159 sends landed at exactly 1.000s (mean 1.000).
+  # 2. The server only decodes once it has accumulated MORE than its
+  #    --min-chunk-size of speech (strict >, see vac_online_processor.py). So
+  #    --min-chunk-size must be strictly less than the value here, or the server
+  #    buffers two of our chunks and the cadence gets worse, not better:
+  #    at 1.0 here against the server's default 1.2 the result would be 2.0s.
+  #    Current pairing: 0.9 here <-> --min-chunk-size 0.9 on the server, giving
+  #    a real 1.0s cadence. Change the two together or not at all.
+  #    Do not "fix" this by relaxing the server's > to >=. That would let
+  #    --min-chunk-size equal the chunk size, but only on exact equality, and the
+  #    server's accumulator often lands short of a whole chunk: three of the four
+  #    paths in VACOnlineASRProcessor.insert_audio_chunk add a partial slice
+  #    (audio_buffer[frame:] at speech onset, [:frame] at speech end, [beg:end]
+  #    when one chunk holds both), and only the mid-speech path adds the whole
+  #    buffer. One sample short then costs a full extra chunk of latency, at
+  #    sentence starts specifically. A strictly-lower threshold expresses the same
+  #    intent and keeps 100ms of slack to absorb those partials.
+  #
+  # Do not tune this further. The 2026-08-21 A/B took the cadence from 1.5s to
+  # 1.0s and gained only 138ms of end-to-end p50, while making p90 worse: a word
+  # cannot be confirmed until ~0.7s of future audio has been decoded, and the
+  # chunk size that audio was cut into does not change that wait. Network and
+  # server decode are not the constraint either (round trip p50 0.226s). See the
+  # full decomposition and the remaining lever (--frame_threshold) in
+  # config/trans.yaml.
+  streaming_interval: 0.9
 
 logging:
   level: "INFO"
@@ -32,6 +67,11 @@ logging:
 display:
   enabled: false
   host: "127.0.0.1"
-  port: 8765
-  width: 900   # overlay window width in pixels
-  height: 400   # overlay window height in pixels 
+  port: 18765    # must stay above 15000 -- Hyper-V/WSL2 reserves port blocks out of
+                 # Windows' TCP dynamic range (1024-15000) and re-picks them at every
+                 # boot; binding inside one fails with WinError 10013. See display_protocol.py
+  width: 900     # overlay window width in pixels
+  height: 400    # overlay window height in pixels
+  opacity: 140    # background panel opacity, 0-255 (also adjustable live via the Settings window)
+  theme: "dark"   # "dark" (black background, white text) | "light" (white background, black text);
+                  # also switchable live via the Settings window (right-click the overlay)

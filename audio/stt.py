@@ -24,6 +24,9 @@ Design notes:
   - Each source (mic/loopback) uses one persistent TCP connection, sending
     incrementally via send_incremental(); internally it tracks "how far we've sent"
     per source, and resets on is_final.
+  - A short burst of silence is sent periodically while nothing else is being sent,
+    to keep the connection alive -- see _keepalive_loop for why this is required
+    rather than merely nice to have.
   - Automatically reconnects on network/server errors, so a single hiccup doesn't
     kill the whole transcription session.
 """
@@ -38,6 +41,13 @@ import numpy as np
 
 from utils.logger import logger
 
+# Magic prefix of the optional per-connection configuration header, which must match
+# the server's HANDSHAKE_MAGIC in whisper_server.py. The server recognizes the header
+# by this prefix alone and treats anything else as audio, which is what makes sending
+# it safe against an older server: an older build has no header parsing at all, so
+# these bytes would be decoded as a fraction of a second of noise and nothing worse.
+SESSION_HEADER_MAGIC = b"SSCFG1 "
+
 
 class RemoteSTTClient:
     """A persistent streaming connection from a single source (e.g. loopback) to the remote SimulStreaming service"""
@@ -51,6 +61,9 @@ class RemoteSTTClient:
         sample_rate: int = 16000,
         reconnect_delay: float = 2.0,
         connect_timeout: float = 5.0,
+        keepalive_interval: float = 60.0,
+        is_healthy=None,
+        session_prompt: str | None = None,
     ):
         """
         Args:
@@ -63,6 +76,22 @@ class RemoteSTTClient:
             sample_rate: sample rate, must match the server (default 16000)
             reconnect_delay: seconds to wait before reconnecting after a disconnect
             connect_timeout: timeout in seconds for a single connection attempt
+            keepalive_interval: send a short burst of silence if nothing has been sent
+                       for this long, to stop the server from closing an idle
+                       connection (see _keepalive_loop). Must stay comfortably below
+                       the server's --client-timeout, which defaults to 300s.
+                       0 disables it.
+            is_healthy: optional callable returning whether our own audio capture is
+                       still working. Gates the keepalive -- see _keepalive_loop for
+                       why sending it unconditionally would be actively harmful.
+                       None means "assume healthy".
+            session_prompt: optional text describing what this recording is about,
+                       sent once per connection so the server conditions its decoder
+                       on it. Only worth setting when the subject and the proper
+                       nouns in it are known in advance -- a prompt that does not
+                       match the audio measurably makes recognition worse, not just
+                       no better. None or "" sends no header at all, leaving whatever
+                       the server was launched with. See config/trans.yaml.
         """
         self.host = host
         self.port = port
@@ -71,12 +100,18 @@ class RemoteSTTClient:
         self.sample_rate = sample_rate
         self.reconnect_delay = reconnect_delay
         self.connect_timeout = connect_timeout
+        self.keepalive_interval = keepalive_interval
+        self.is_healthy = is_healthy
+        self.session_prompt = session_prompt or None
 
         self._sock: socket.socket | None = None
         self._send_lock = threading.Lock()
         self._sent_samples = 0  # sample position the current utterance has been sent up to (for incremental sending)
+        self._last_send_ts = 0.0  # when we last put any bytes on the wire, for keepalive accounting
+        self._silence = np.zeros(int(0.1 * sample_rate), dtype=np.int16).tobytes()
         self._running = False
         self._reader_thread: threading.Thread | None = None
+        self._keepalive_thread: threading.Thread | None = None
         self._connected = threading.Event()
 
     def start(self):
@@ -88,6 +123,11 @@ class RemoteSTTClient:
             target=self._connection_loop, daemon=True, name=f"stt-remote-{self.source}"
         )
         self._reader_thread.start()
+        if self.keepalive_interval:
+            self._keepalive_thread = threading.Thread(
+                target=self._keepalive_loop, daemon=True, name=f"stt-keepalive-{self.source}"
+            )
+            self._keepalive_thread.start()
 
     def stop(self):
         self._running = False
@@ -101,6 +141,8 @@ class RemoteSTTClient:
                 self._sock = None
         if self._reader_thread:
             self._reader_thread.join(timeout=3)
+        if self._keepalive_thread:
+            self._keepalive_thread.join(timeout=3)
 
     def _connection_loop(self):
         """Keep trying to connect, reconnecting after disconnects, until stop() is called"""
@@ -111,8 +153,16 @@ class RemoteSTTClient:
                 )
                 sock.settimeout(None)  # subsequent reads can block; we rely on the peer closing/erroring to exit
                 with self._send_lock:
+                    # The header must be the first bytes on this connection, so send it
+                    # while self._sock is still None: send_incremental and the keepalive
+                    # both bail out on a None socket, which is what stops either of them
+                    # from putting audio in front of the header.
+                    self._send_session_header(sock)
                     self._sock = sock
                     self._sent_samples = 0
+                    # Count the keepalive window from the moment we connect, not from
+                    # process start, so a fresh connection doesn't immediately emit one.
+                    self._last_send_ts = time.time()
                 self._connected.set()
                 logger.info(f"[{self.source}] Connected to remote speech recognition service {self.host}:{self.port}")
                 self._read_loop(sock)
@@ -124,6 +174,31 @@ class RemoteSTTClient:
                     self._sock = None
             if self._running:
                 time.sleep(self.reconnect_delay)
+
+    def _send_session_header(self, sock: socket.socket):
+        """Send the per-connection configuration header, if a prompt is configured.
+
+        Sent on every connection, including reconnects: the server rebuilds its
+        decoder context per connection and resets any key it is not told about, so a
+        reconnect mid-meeting would otherwise silently lose the prompt.
+
+        Failures here are raised, not swallowed -- the caller's reconnect path
+        handles them. Sending audio to a server that never got the header would work
+        but transcribe under the wrong conditioning, which is harder to notice than
+        a reconnect.
+        """
+        if not self.session_prompt:
+            return
+        header = (
+            SESSION_HEADER_MAGIC
+            + json.dumps({"static_init_prompt": self.session_prompt}).encode("utf-8")
+            + b"\n"
+        )
+        sock.sendall(header)
+        logger.info(
+            f"[{self.source}] Sent session prompt to the recognition server "
+            f"({len(self.session_prompt)} chars): {self.session_prompt!r}"
+        )
 
     def _read_loop(self, sock: socket.socket):
         """Continuously read line-delimited JSON results from the server until the connection closes or errors"""
@@ -166,6 +241,83 @@ class RemoteSTTClient:
                 self.on_result(self.source, result)
             except Exception as e:
                 logger.error(f"[{self.source}] Error in recognition result callback: {e}")
+
+    def _keepalive_loop(self):
+        """Send a short burst of silence whenever nothing else has been sent for
+        keepalive_interval seconds.
+
+        This is required, not cosmetic. The server closes any connection that has
+        received no audio for --client-timeout seconds (300 by default) -- it serves
+        one client at a time, so it cannot let a connected-but-mute client block
+        every other one. But we only transmit while our own VAD reports speech, so a
+        session where nobody happens to be talking sends literally zero bytes and
+        looks exactly like a client whose capture died. Getting dropped for that is
+        bad in a specific way: send_incremental discards audio while disconnected,
+        so the reconnect_delay seconds after the drop are a hole, and the thing most
+        likely to happen right after a long silence is someone starting to speak.
+
+        Silence is safe to send: the client already transmits the trailing silent
+        blocks of every utterance (that is what lets the server's VAC detect
+        end-of-speech at all), so this is nothing the server does not routinely
+        handle -- its VAD sees no speech and runs no ASR, costing no GPU work.
+
+        But it must NOT be sent unconditionally, and this is the subtle part. The
+        server's timeout exists to evict a client whose capture died while its socket
+        stayed healthy -- otherwise that client blocks every other one, which is
+        exactly the failure that once wedged the server for hours. From the server's
+        side "quiet room" and "dead capture" are indistinguishable: both send
+        silence, or nothing. So keeping the connection warm regardless of our own
+        state would defeat the eviction entirely and reinstate that bug. We are the
+        only side that can tell the two apart, so the keepalive is gated on
+        is_healthy(): if our capture is gone, we deliberately stop keeping the
+        connection alive and let the server reclaim it.
+
+        Note the gate is only as good as its signal -- it catches a dead capture
+        process, not a live one whose device thread has wedged while still being
+        polled. That narrower case remains uncovered on both sides.
+        """
+        while self._running:
+            time.sleep(1.0)
+            if not self._running:
+                break
+            if self.is_healthy is not None:
+                try:
+                    healthy = self.is_healthy()
+                except Exception as e:
+                    # A failing health check is not evidence of health.
+                    logger.debug(f"[{self.source}] Keepalive health check raised: {e}")
+                    healthy = False
+                if not healthy:
+                    continue
+            with self._send_lock:
+                sock = self._sock
+                if sock is None:
+                    continue
+                # _sent_samples > 0 means an utterance is in flight; never inject
+                # silence into the middle of one. An utterance in progress is also
+                # sending regularly, so the interval below would not have elapsed.
+                if self._sent_samples > 0:
+                    continue
+                if time.time() - self._last_send_ts < self.keepalive_interval:
+                    continue
+                try:
+                    sock.sendall(self._silence)
+                except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                    # Let the reader thread drive the reconnect; just drop the socket
+                    # here, same as send_incremental does.
+                    logger.warning(f"[{self.source}] Keepalive send failed: {e}")
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                    self._sock = None
+                    continue
+                self._last_send_ts = time.time()
+                logger.debug(
+                    f"[{self.source}] Sent keepalive silence "
+                    f"({len(self._silence) // 2 / self.sample_rate:.2f}s) after "
+                    f"{self.keepalive_interval:.0f}s idle"
+                )
 
     def send_incremental(self, full_buffer: np.ndarray, is_final: bool):
         """
@@ -214,6 +366,7 @@ class RemoteSTTClient:
                     f"total sent so far={len(full_buffer) / self.sample_rate:.3f}s"
                 )
                 self._sent_samples = len(full_buffer)
+                self._last_send_ts = time.time()
 
             if is_final:
                 logger.debug(f"[{self.source}] Utterance ended (is_final), resetting send position")
@@ -241,17 +394,24 @@ class SpeechRecognizer:
         stt.stop()
     """
 
-    def __init__(self, sources: dict[str, tuple[str, int]], on_result=None, sample_rate: int = 16000):
+    def __init__(self, sources: dict[str, tuple[str, int]], on_result=None, sample_rate: int = 16000,
+                 is_healthy=None, session_prompt: str | None = None):
         """
         Args:
             sources: {source_name: (host, port)}, e.g. {"loopback": ("<remote recognition service address>", 45678)}
             on_result: callback on_result(source, result_dict), invoked when a remote recognition result arrives
             sample_rate: sample rate, must match the server's config
+            is_healthy: optional callable returning whether audio capture is still
+                       working; forwarded to each connection to gate its keepalive
+                       (see RemoteSTTClient._keepalive_loop)
+            session_prompt: optional description of what is being recorded, forwarded
+                       to every connection (see RemoteSTTClient)
         """
         self.sample_rate = sample_rate
         self._clients: dict[str, RemoteSTTClient] = {
             source: RemoteSTTClient(
-                host=host, port=port, source=source, on_result=on_result, sample_rate=sample_rate
+                host=host, port=port, source=source, on_result=on_result, sample_rate=sample_rate,
+                is_healthy=is_healthy, session_prompt=session_prompt,
             )
             for source, (host, port) in sources.items()
         }

@@ -146,6 +146,10 @@ class ZxAgent:
         # the rolling context) needs it concatenated here first. Reset to ""
         # whenever is_final=True closes out an utterance.
         self._transcript_accum = {"mic": "", "loopback": ""}
+        # transcribe mode only: how much of the case-normalized full_text has
+        # already been printed to the terminal for each source, so only the
+        # newly-added tail gets printed on each update (see _on_remote_result).
+        self._transcript_printed_len = {"mic": 0, "loopback": 0}
 
         self._init_stt()
         self._init_llm()
@@ -248,7 +252,27 @@ class ZxAgent:
             sources=sources,
             on_result=self._on_remote_result,
             sample_rate=self.config.get("audio", {}).get("sample_rate", 16000),
+            # Per-recording decoder conditioning. Empty by default and meant to stay
+            # that way for everyday use: it only helps when it describes the audio at
+            # hand. Set it before a call whose subject and names are known. See the
+            # stt.session_prompt notes in config/trans.yaml.
+            session_prompt=self._resolve_env_var(stt_config.get("session_prompt", "")) or None,
+            # Late-bound on purpose: _init_listener() runs after this, so
+            # self.listener does not exist yet. The callback is only ever invoked
+            # from the STT client's keepalive thread, long after both exist.
+            # It reports False until listener.start(), which is correct -- there is
+            # nothing to keep a connection alive for before capture is running.
+            is_healthy=self._capture_is_healthy,
         )
+
+    def _capture_is_healthy(self) -> bool:
+        """Whether audio capture is currently working. Gates the STT keepalive so a
+        client whose capture died stops holding the (one-client-at-a-time) recognition
+        server open -- see RemoteSTTClient._keepalive_loop."""
+        listener = getattr(self, "listener", None)
+        if listener is None:
+            return False
+        return listener.is_capture_alive()
 
     def _init_llm(self):
         ai_config = self.config.get("ai", {})
@@ -305,13 +329,15 @@ class ZxAgent:
         if self._gui_override is not None:
             enabled = self._gui_override
         host = display_config.get("host", "127.0.0.1")
-        port = display_config.get("port", 8765)
+        port = display_config.get("port", 18765)
 
         self._gui_process = None
         if enabled and self._gui_auto_launch:
             width = display_config.get("width")
             height = display_config.get("height")
-            self._gui_process = self._maybe_launch_gui(host, port, width, height)
+            opacity = display_config.get("opacity")
+            theme = display_config.get("theme")
+            self._gui_process = self._maybe_launch_gui(host, port, width, height, opacity, theme)
 
         self.display = DisplayPublisher(
             enabled=enabled,
@@ -320,7 +346,7 @@ class ZxAgent:
             logger=logger,
         )
 
-    def _maybe_launch_gui(self, host, port, width=None, height=None):
+    def _maybe_launch_gui(self, host, port, width=None, height=None, opacity=None, theme=None):
         """Launch `python -m gui.app` as a child process, unless something is
         already listening on host:port (e.g. the user started the GUI manually
         in another terminal -- don't spawn a second, redundant overlay window).
@@ -328,10 +354,13 @@ class ZxAgent:
         never imports anything from gui/ or PyQt directly -- it just shells out
         to a separate `python -m gui.app` process, same as running it by hand.
 
-        width/height (optional, from config.display.width/height) are forwarded
-        as --width/--height so the auto-launched window matches whatever size
-        was configured, instead of always falling back to gui.app's built-in
-        default."""
+        width/height/opacity/theme (optional, from config.display.*) are
+        forwarded as the matching --flag so the auto-launched window starts
+        with whatever was configured, instead of always falling back to
+        gui.app's built-in defaults. All four are also adjustable live from
+        the GUI's own Settings window (right-click the overlay) regardless of
+        what they started as -- these config values only set the initial
+        state at launch."""
         probe_host = "127.0.0.1" if host in ("0.0.0.0", "") else host
         try:
             with socket.create_connection((probe_host, port), timeout=0.3):
@@ -345,14 +374,45 @@ class ZxAgent:
             cmd += ["--width", str(width)]
         if height:
             cmd += ["--height", str(height)]
+        if opacity is not None:
+            cmd += ["--opacity", str(opacity)]
+        if theme:
+            cmd += ["--theme", str(theme)]
+
+        env = dict(os.environ)
+        env[_GUI_LAUNCH_TOKEN_ENV] = "1"
 
         try:
-            proc = subprocess.Popen(cmd, cwd=str(Path(__file__).resolve().parent))
+            proc = subprocess.Popen(cmd, cwd=str(Path(__file__).resolve().parent), env=env)
             logger.info(f"Launched GUI overlay (pid={proc.pid})")
+            self._start_gui_monitor(proc)
             return proc
         except Exception as e:
             logger.warning(f"Failed to auto-launch GUI overlay: {e}")
             return None
+
+    def _start_gui_monitor(self, proc):
+        """Since --gui/-g explicitly asked to pair the agent with a GUI
+        overlay it launched itself, treat that pairing as a real session:
+        if the GUI process exits for any reason (Quit from its tray menu,
+        the window being killed, a crash), the agent shuts itself down too,
+        rather than continuing to run headless with no display and no way
+        to bring one back short of restarting the agent.
+
+        Polling in a plain daemon thread rather than a signal/callback,
+        since subprocess.Popen doesn't offer an exit notification and this
+        only needs to react within a second or so, not instantly."""
+        def _watch():
+            proc.wait()  # blocks until the GUI process exits, however it exits
+            if self._running:
+                logger.info(
+                    f"GUI overlay (pid={proc.pid}) exited -- shutting down the "
+                    f"agent too, since it was launched paired via --gui/-g"
+                )
+                self._running = False
+
+        thread = threading.Thread(target=_watch, daemon=True, name="gui-monitor")
+        thread.start()
 
     def _init_listener(self):
         audio_config = self.config.get("audio", {})
@@ -403,6 +463,87 @@ class ZxAgent:
         except Exception as e:
             logger.error(f"Error forwarding audio to the remote recognition service: {e}")
 
+    # Minimum number of CONSECUTIVE all-caps words required before treating a
+    # stretch of text as "Whisper's emphatic/agitated-speech all-caps quirk"
+    # and normalizing it. Kept intentionally low-risk: a single all-caps word
+    # (an acronym like "NASA"/"TV"/"OK", or a name written in caps) is left
+    # completely untouched -- only genuinely sentence-length runs get
+    # degraded, so normal mixed-case speech is never altered.
+    _CAPS_RUN_THRESHOLD = 3
+
+    @staticmethod
+    def _looks_capsy(word: str) -> bool:
+        """Whether `word` looks like an all-caps token: at least 1 alphabetic
+        character and every one of them uppercase. Used for BOTH detecting
+        contiguous run boundaries and counting run length -- deliberately
+        includes single-letter words ("I", "A") so they don't break up an
+        otherwise-continuous run just because they're short (e.g. "...AT
+        ALL? IT CAUSED A LOT OF..." is one 9-word run, not two runs split
+        around "A"). Whether a word actually gets degraded once it's inside
+        a long-enough run is decided separately -- see _degrade_all_caps_runs."""
+        letters = [c for c in word if c.isalpha()]
+        return len(letters) >= 1 and all(c.isupper() for c in letters)
+
+    @classmethod
+    def _degrade_all_caps_runs(cls, text: str) -> str:
+        """Lowercase words that are part of a run of _CAPS_RUN_THRESHOLD or
+        more CONSECUTIVE all-caps words, leaving isolated all-caps words
+        (acronyms, etc.) exactly as they came from the model.
+
+        Whisper has a known quirk: for emphatic/agitated speech (raised
+        voice, arguing, etc.) it sometimes renders a whole stretch of text in
+        all-caps, mirroring a subtitle convention from its training data.
+        That is not reliable signal in practice -- it is an all-or-nothing
+        side effect tied to how a segment happens to get decoded, not a
+        deliberate word-by-word emphasis marker -- so long runs of it are
+        normalized away. A single capitalized word on its own (run length 1)
+        is far more likely to be a genuine acronym/proper noun than "the
+        model is shouting", so those are left alone; only a real run (a
+        whole clause/sentence, run length >= _CAPS_RUN_THRESHOLD) is treated
+        as the quirk and degraded.
+
+        The pronoun "I" is never degraded even when it falls inside a
+        confirmed long run, since it is always capitalized in standard
+        English regardless of tone/emphasis -- but it still counts toward
+        the run's length and does not break run continuity, so a run like
+        "YOU KNOW I MUST GO NOW" still gets treated as one continuous run.
+
+        Operates on the full accumulated utterance text (not a single
+        streaming delta) specifically so a run split across two separate
+        incremental updates -- e.g. delta 1 ends "...text YOU", delta 2
+        starts "DON'T BUY..." -- is still correctly detected as one 3-word
+        run, instead of two sub-threshold fragments that would each be
+        wrongly left untouched."""
+        words = text.split(" ")
+        capsy = [cls._looks_capsy(w) for w in words]
+        i, n = 0, len(words)
+        while i < n:
+            if not capsy[i]:
+                i += 1
+                continue
+            j = i
+            while j < n and capsy[j]:
+                j += 1
+            if j - i >= cls._CAPS_RUN_THRESHOLD:
+                for k in range(i, j):
+                    if words[k].upper() != "I":
+                        words[k] = words[k].lower()
+            i = j
+        return " ".join(words)
+
+    @staticmethod
+    def _capitalize_first_letter(text: str) -> str:
+        """Capitalize the first alphabetic character in `text`, leaving
+        everything else untouched. Used after _degrade_all_caps_runs to fix
+        up the sentence-initial word when a run starting at the very
+        beginning of the utterance got degraded -- e.g. "YOU DON'T BUY..."
+        degrades to "you don't buy...", which needs to become "You don't
+        buy..." for a normal sentence start."""
+        for i, c in enumerate(text):
+            if c.isalpha():
+                return text[:i] + c.upper() + text[i + 1:]
+        return text
+
     def _on_remote_result(self, source, result: dict):
         """Callback for incremental results from the remote recognition service
         (invoked on the STT client's reader thread).
@@ -421,26 +562,60 @@ class ZxAgent:
         is_final = result.get("is_final", False)
 
         # `delta` is only the newly confirmed increment for this update (see
-        # audio/stt.py) -- accumulate it into the running sentence for this
-        # source so anything downstream (GUI, LLM, context) sees the full
-        # current sentence, not a fragment.
+        # audio/stt.py) -- accumulate the RAW (un-normalized) delta here, then
+        # recompute the case-normalized full text from scratch every time (see
+        # _degrade_all_caps_runs) rather than normalizing delta-by-delta. This
+        # matters because a genuine all-caps run can span a delta boundary
+        # (see that method's docstring) -- normalizing only the current delta
+        # in isolation could see fewer than _CAPS_RUN_THRESHOLD caps words and
+        # wrongly leave a real run untouched.
         if delta:
             self._transcript_accum[source] += delta
-        full_text = self._transcript_accum[source]
+        full_text = self._degrade_all_caps_runs(self._transcript_accum[source])
+        full_text = self._capitalize_first_letter(full_text)
 
         if self.mode == "transcribe":
             if delta:
-                print(delta, end="", flush=True)
+                # Only print the portion of the normalized text that is new
+                # since the last update, to preserve the incremental
+                # live-subtitle printing effect. Case-folding never changes
+                # string length, so this offset stays valid even if an
+                # earlier (already-printed) word's case is retroactively
+                # corrected by a run that only became long enough on this
+                # update -- the terminal just keeps whatever case it already
+                # printed for that word (a minor, rare, cosmetic-only gap;
+                # the GUI/LLM/context below always see the fully corrected
+                # text, since they're sent the complete current string each
+                # time rather than a diff).
+                printed_len = self._transcript_printed_len[source]
+                print(full_text[printed_len:], end="", flush=True)
+                self._transcript_printed_len[source] = len(full_text)
+            # `delta or is_final`, not just `delta`: the remote service's
+            # final update for an utterance often carries no new text at all
+            # (everything was already confirmed in earlier partial updates --
+            # this is-final message is purely "this utterance is now over").
+            # Gating the GUI push on `delta` alone meant the GUI never learned
+            # is_final=True for those utterances -- it stayed sitting in
+            # _transcript_partial (see OverlayWindow._on_transcript) and got
+            # silently overwritten the moment the NEXT utterance's first
+            # partial arrived, i.e. the whole utterance visibly vanished from
+            # the GUI even though the terminal (which prints incrementally as
+            # deltas arrive, independent of this call) showed it correctly.
+            if delta or is_final:
                 self.display.transcript(full_text, source, is_final)
             if is_final:
                 print(flush=True)
                 self._transcript_accum[source] = ""
+                self._transcript_printed_len[source] = 0
             return
 
         # assist mode
-        if delta:
+        # Same `delta or is_final` fix as transcribe mode above -- otherwise
+        # an utterance whose final update carries no new text never reaches
+        # the GUI as a completed line.
+        if delta or is_final:
             self.display.transcript(full_text, source, is_final)
-            if source == "mic":
+            if source == "mic" and delta:
                 if not self._question_fired[source] and full_text.strip().endswith("?"):
                     self._question_fired[source] = True
                     logger.info(f"Question detected: {full_text}")
@@ -532,10 +707,16 @@ class ZxAgent:
 
     def run_once(self):
         logger.info("One-shot Q&A mode, please speak...")
+        self._running = True
         self.listener.start()
         try:
-            # The model is already warmed up, 30 seconds is enough
-            time.sleep(30)
+            # The model is already warmed up, 30 seconds is enough. Polling
+            # self._running in small increments (rather than one flat sleep(30))
+            # so a paired GUI overlay exiting (see _start_gui_monitor) can end
+            # this early too, same as it does for run().
+            deadline = time.time() + 30
+            while self._running and time.time() < deadline:
+                time.sleep(0.5)
         except KeyboardInterrupt:
             pass
         finally:
@@ -599,7 +780,11 @@ def main():
         help="Enable the transparent overlay GUI display (overrides display.enabled "
              "in the config file). Also auto-launches `python -m gui.app` as a "
              "child process if nothing is already listening on the configured "
-             "host:port, so a single command starts both -- no need to run it separately.",
+             "host:port, so a single command starts both. The two are paired for "
+             "the rest of the session: closing the GUI (Quit from its tray icon, "
+             "or the window being killed) shuts this agent process down too, and "
+             "vice versa. gui.app also refuses to run standalone by hand -- --gui/-g "
+             "on this command is the only supported way to start it.",
     )
     parser.add_argument(
         "--log-level", "-v",
