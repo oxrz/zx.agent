@@ -38,17 +38,6 @@ from ai.llm import LLMClient, LLMConfig
 from memory import ContextBuffer
 from gui.publisher import DisplayPublisher
 
-# Env var set on the GUI subprocess we spawn (see _maybe_launch_gui) so
-# gui/app.py can tell "launched by this agent" apart from "run directly by
-# hand" and refuse the latter -- --gui/-g is meant to be the only entry
-# point, since agent and GUI are now a paired session (see the GUI-process
-# monitor in run()/run_once()/shutdown()). Must match the identical literal
-# in gui/app.py -- kept as a plain duplicated string rather than a shared
-# import, since importing anything from gui/app.py would pull in PyQt6 at
-# module load time, which the agent core must never depend on, even
-# indirectly.
-_GUI_LAUNCH_TOKEN_ENV = "AGENTIC_GUI_LAUNCH_TOKEN"
-
 
 def set_high_performance():
     """Set the process to high-performance mode (Windows)"""
