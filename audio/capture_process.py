@@ -366,6 +366,22 @@ class AudioCaptureProcess:
                 self._process.terminate()
         self._process = None
 
+    def is_capture_alive(self) -> bool:
+        """Whether the capture subprocess is still running.
+
+        Used by the remote STT client to decide whether to keep its connection
+        alive during silence: a healthy but quiet session should hold its
+        connection, while a session whose capture has died should let the server
+        reclaim it instead of occupying a server that serves one client at a time
+        (see RemoteSTTClient._keepalive_loop).
+
+        This reports on the process, which is the failure that has actually been
+        observed -- an audio device error escaping to _capture_worker's outer
+        handler and taking the whole subprocess with it. It cannot see a live
+        subprocess whose device thread has wedged.
+        """
+        return bool(self._running and self._process is not None and self._process.is_alive())
+
     def _consume_audio(self):
         """Quickly move items from the cross-process queue to the local queue, without
         any heavy processing, to guarantee the subprocess's capture loop is never blocked"""

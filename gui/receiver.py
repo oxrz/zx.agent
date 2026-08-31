@@ -43,7 +43,30 @@ class DisplayReceiver(QObject):
         self._running = True
         self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._server_sock.bind((self._host, self._port))
+        try:
+            self._server_sock.bind((self._host, self._port))
+        except OSError as e:
+            # Windows only: WSAEACCES (10013) on bind almost never means "busy" --
+            # a busy port gives WSAEADDRINUSE (10048). It means the port sits in a
+            # range Hyper-V has reserved out of the TCP dynamic port range, which
+            # WSL2 causes and which is re-picked at every boot. Nothing is
+            # listening on a reserved port, so the agent core's pre-launch probe
+            # sees it as free and starts this process anyway. Say so explicitly:
+            # the bare OSError sends people hunting for a process to kill that
+            # does not exist.
+            self._server_sock.close()
+            self._server_sock = None
+            self._running = False
+            if getattr(e, "winerror", None) == 10013:
+                raise OSError(
+                    f"Cannot bind {self._host}:{self._port} -- the port is reserved by "
+                    f"Windows (WinError 10013), not in use by another program. Hyper-V "
+                    f"(enabled by WSL2) reserves port blocks out of the dynamic range "
+                    f"(usually 1024-15000) and re-picks them on every boot. List them with "
+                    f"'netsh interface ipv4 show excludedportrange protocol=tcp' and set "
+                    f"display.port in config/common.yaml to a port above 15000."
+                ) from e
+            raise
         self._server_sock.listen(5)
         self._accept_thread = threading.Thread(
             target=self._accept_loop, daemon=True, name="display-receiver-accept"

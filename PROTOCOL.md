@@ -9,7 +9,14 @@ versa.
 
 ## Transport
 
-- Local TCP socket, default `127.0.0.1:8765`.
+- Local TCP socket, default `127.0.0.1:18765`.
+- The port is deliberately above 15000. On Windows, Hyper-V (enabled by WSL2)
+  reserves blocks of ports out of the TCP dynamic port range -- by default
+  `1024-15000` -- and re-picks those blocks at every boot. Binding inside a
+  reserved block fails with `WinError 10013`, and since nothing is actually
+  listening there, the port looks free to any connect-based liveness probe.
+  Check the current reservations with
+  `netsh interface ipv4 show excludedportrange protocol=tcp`.
 - The **GUI is the TCP server** (binds and listens). The **agent core is the
   TCP client** (connects out).
 - This direction was chosen deliberately: the GUI can be started or restarted

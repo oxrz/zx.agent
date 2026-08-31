@@ -32,7 +32,16 @@ import time
 from typing import Any, Dict
 
 DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 8765
+# Deliberately above 15000. On Windows, Hyper-V (which WSL2 enables) reserves
+# blocks of ports out of the TCP dynamic port range -- by default 1024-15000 --
+# and picks fresh blocks at boot. Binding inside a reserved block fails with
+# WinError 10013 rather than the 10048 you would expect for a busy port, and
+# nothing is listening there, so it reads as "free" to every liveness probe.
+# The previous default of 8765 sat inside one such block after a reboot and
+# broke the overlay intermittently. Anything above the dynamic range is immune.
+# Check the current reservations with:
+#   netsh interface ipv4 show excludedportrange protocol=tcp
+DEFAULT_PORT = 18765
 
 
 def encode_message(msg: Dict[str, Any]) -> bytes:

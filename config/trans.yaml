@@ -10,12 +10,335 @@ stt:
   # on a dedicated GPU server, AMD 7900XTX + ROCm 6.3 accelerated). No local model loading anymore --
   # the client only captures/forwards/displays audio.
   # Test finding (2026-07-23): local AMD iGPU (DirectML) inference of the medium model takes 5s+ per
-  # 8s-audio segment, making streaming effectively useless; after switching to a remote GPU server,
-  # inference time dropped to the 100-300ms range. Full migration writeup dated 2026-07-24, measured
-  # RTF < 0.06, end-to-end latency 1-2s.
+  # 8s-audio segment, making streaming effectively useless, hence the move to a remote GPU server.
+  # Measured on the server (2026-08-19, large-v3, 260s of speech, 173 iterations, VAD-like resets):
+  #   fp32           p50 724ms  p90 777ms  max 874ms   RTF 0.48
+  #   fp16 autocast  p50 210ms  p90 249ms  max 324ms   RTF 0.14   <- current, --fp16 is the default
+  # fp16 output is byte-identical to fp32 over the whole file (521 words, 0 differences).
+  # End-to-end latency is NOT bounded by inference, and as of the 2026-08-21 A/B it is not
+  # bounded by the client's send cadence either. The three columns below measure the full path
+  # from a word being spoken to its text reaching the client, with the audio clock re-aligned
+  # per contiguous capture segment (residual drift <0.01s, so these are real wall-clock
+  # numbers, not relative ones). A FOURTH run at the rightmost config was made later and is
+  # cited further down for its transcript, but it was logged at -l INFO and therefore carries
+  # no latency data at all -- see the MEASUREMENT TRAP note at the end:
+  #
+  #   streaming_interval / --min-chunk-size   1.0 / 1.2     0.9 / 0.9     0.9 / 0.9
+  #   --frame_threshold                          25            25            15
+  #   send cadence                   p50        1.500s        1.000s        1.000s
+  #   AlignAtt confirmation lag      p50        0.736s        0.700s        0.492s
+  #   END-TO-END, spoken -> shown    p50        1.076s        0.938s        0.749s
+  #                                  p90        1.588s        1.873s        1.237s
+  #                                  p99          --          3.319s        1.714s
+  #                                  max          --          3.637s        1.860s
+  #   server iterations doing no work            28%           7.1%          4.5%
+  #
+  # Two findings, in increasing order of what they cost to learn.
+  #
+  # 1. Cadence is a spent lever. Cutting it by a third bought only 138ms of p50 and made the
+  #    tail worse. The decomposition says why: 0.700 (AlignAtt) + 0.226 (round trip, measured
+  #    separately) = 0.926, which is already the 0.938 observed -- there is no buffer-wait
+  #    term left to remove. A word cannot be confirmed until ~0.7s of FUTURE audio has
+  #    arrived and been decoded, and while that future audio is in flight the chunk size it
+  #    was cut into does not matter; the same 0.7s elapses either way. Shortening the cadence
+  #    only trims the rounding on top. Do not tune streaming_interval or block_duration.
+  #
+  # 2. --frame_threshold is the lever that works, and the quality cost it first appeared to
+  #    carry turns out to point the other way -- see the comparison below the table. It is
+  #    AlignAtt's commit policy: emission stops while the
+  #    most-attended encoder frame is within that many frames of the end of the audio
+  #    (simul_whisper.py, the `content_mel_len - most_attended_frame <= frame_threshold`
+  #    break). At ~20ms per encoder frame, 25 is ~0.5s -- most of the 0.700s above.
+  #    25 -> 15 cut p50 by 189ms as predicted, and also narrowed the tail sharply, which
+  #    was NOT predicted (the expectation was that earlier commits would destabilise it).
+  #    The last row is the likely reason: ft25 spent more iterations committing nothing at
+  #    all, and a chunk that commits nothing pushes its words into the next chunk's wait.
+  #
+  # The two thresholds were compared by diffing transcripts word-by-word over the same
+  # ~160s of speech -- the longer run truncated to the shorter one's span, with anchor phrases
+  # confirming the timelines agree to within 1.7s of slowly-accumulating VAC drift. 479 vs 481
+  # words, 94.8% similar, 21 differing regions:
+  #   - 9 are words ft15 emits and ft25 does not ("um", "uh", "If if", "no", "that could").
+  #     The obvious reading is "ft15 commits before the following audio reveals the filler was
+  #     a false start". A second ft15 run showed that reading has the sign backwards; the
+  #     paragraph after this list is the corrected version.
+  #   - 4 are pure orthography ("programmes"/"programs", "healthcare"/"health care") -- not
+  #     errors at all. 2 more go the other way: fillers ft25 emitted and ft15 did not.
+  #   - Each run also made one or two substitution errors, and a THIRD run at ft15 proved
+  #     they are run-to-run noise rather than a property of the threshold. The two ft15 runs
+  #     share almost no errors: the first turned "ban the use of" into "back the use of" and
+  #     "Bezos" into "Bezels" and garbled a clause; the second got all three right and
+  #     instead turned "Kimi K3" into "Give me K3". Do NOT read any single substitution as
+  #     evidence about frame_threshold -- at ~500 words per run the rate is about one event,
+  #     and the events move. (An earlier version of this comment claimed ft25 fabricated the
+  #     clause "Well, in most of these countries, USAID"; the second ft15 run reproduced
+  #     that clause independently, so it is real speech and the first ft15 run was the one
+  #     that garbled it.)
+  #   - What IS reproducible across all four no-prompt runs is proper nouns, and it is not a
+  #     threshold effect at all: "Kimi" was never once transcribed correctly (three runs
+  #     said "Kimmy K3", one said "Give me K3"), and the surname in "MacKenzie, whatever
+  #     her last name is, used to be Bezos" came out as McKenzie / McKinsey /
+  #     McKenzie-Benzels'. 4-for-4 failure with a config-independent cause is what
+  #     --static_init_prompt exists for, and a fifth run has now spent that lever and fixed
+  #     all of it -- see the --static_init_prompt block further down for the result and its
+  #     latency cost. Use that flag and
+  #     NOT --init_prompt: the latter is appended to the rolling context (simul_whisper.py
+  #     `self.context.text += self.cfg.init_prompt`) and scrolls away, whereas
+  #     --static_init_prompt is excluded from context trimming and so survives to the 127s
+  #     mark where the surname actually appears.
+  #   - The "back the use of" error is worth understanding rather than filing as a random
+  #     substitution, because it was the only hard evidence ever held against ft15. The
+  #     prompt run shows the speech contains BOTH words a second apart: "keep China back.
+  #     Do you think they should ban the use of K3". So that run had not invented a word, it
+  #     had mis-attached a real neighbouring one. Substitution errors here tend to be
+  #     displacement rather than fabrication, which is also why they move between runs.
+  #   - Do not trust structural metrics (repeated n-grams, doubled words, timestamp order)
+  #     to find any of this: they are blind to substitutions, and ft15's extra filler words
+  #     actually LOWERED its repeated-trigram rate, making the metric anti-correlated with
+  #     quality. Use a word-level diff between two runs of the same audio instead -- but
+  #     NORMALIZE first, or the diff carries a large noise floor of its own. Whisper's word
+  #     splitting is not stable across runs ("don't"/"don 't", "crud ely"/"cr udely",
+  #     "usaid"/"usa id", "healthcare"/"health care") and it varies in both directions, so
+  #     raw token comparison counts it as disagreement. Rejoining apostrophes and dropping
+  #     punctuation took one comparison from 84.6% similar / 48 regions to 89.7% / 30 -- 18 of
+  #     the 48 regions were pure tokenization. Also compare over a common truncated span:
+  #     these runs are live captures of different lengths (137.8s / 151.4s / 160.2s / 172.2s),
+  #     so raw word counts and words-per-second are not comparable between them at all.
+  #
+  # So: keep --frame_threshold 15. The latency win is a distribution over ~170 emissions and
+  # reproduced across two runs, and the accuracy "cost" did not survive scrutiny at all --
+  # it turned out to be pointing the other way.
+  #
+  # The one systematic difference between the thresholds is that ft15 emits far more of the
+  # speaker's own words, both fillers and content. Over the same 0-138s stretch, filler
+  # tokens per 1000 words: ft25 2.4, ft15 9.7, ft15-repeat 9.5 -- a 4x gap that reproduces
+  # across two independent ft15 runs, unlike the substitutions. More telling, both ft15 runs
+  # independently emit the CONTENT words "that could" (~91s), "this" (~94s), "this and"
+  # (~97s) and "no" (~111s) at the same word-times, and neither ft25 run emits any of them.
+  # Two independent runs producing the same words at the same timestamps means those words
+  # are in the audio; invention does not reproduce that way. So ft25's apparent tidiness is
+  # dropped speech, not cleaner recognition, and the earlier framing of "ft15 leaks
+  # disfluencies" had the sign backwards. If a subtitle wants the fillers suppressed, that
+  # is a post-processing choice, not a reason to raise the threshold and lose content with
+  # them.
+  #
+  # MEASUREMENT TRAP: the latency numbers above come from [recv]/[send]/[process]
+  # instrumentation that is logged at DEBUG. Running the server with -l INFO keeps the JSON
+  # emission lines (so transcripts and word timings survive) but silently discards all of
+  # that, so any run you intend to measure must use -l DEBUG.
   server_host: "${STT_SERVER_HOST}"    # remote recognition service LAN address, see .env
   server_port: "${STT_SERVER_PORT}"    # port simulstreaming_whisper_server.py listens on, see .env
   language: "en"              # already fixed to --language en on the server side; here for documentation only
+  # Optional description of what is about to be recorded, sent to the server once per
+  # connection (audio/stt.py _send_session_header) so it conditions the decoder on it.
+  # Empty is the right everyday value. It is worth filling in only when the subject and
+  # the proper nouns are known before the call, because a prompt that does not match the
+  # audio makes recognition WORSE, not merely no better -- see the block below. Write it
+  # as a natural sentence about the material, not a list of names. Example:
+  #   session_prompt: "A discussion of Kimi K3, USAID funding, MacKenzie Bezos, and US export controls on China."
+  session_prompt: ""
+  # The server is launched by hand and reads no config file, so its flags exist nowhere but
+  # the shell history unless they are written down -- and history is capped at 1000 lines, which
+  # already rotated the tuned invocations out once. The whole command, verified against
+  # --help on the box. Run it from the SimulStreaming checkout; the venv lives one level ABOVE
+  # that checkout rather than inside it, which is the only reason the interpreter path needs
+  # a ../ -- adjust both placeholders to wherever they actually sit:
+  #
+  #     cd <SimulStreaming checkout>
+  #     ../<venv>/bin/python simulstreaming_whisper_server.py \
+  #       --host 0.0.0.0 --port <STT_SERVER_PORT from .env> \
+  #       --language en --task transcribe \
+  #       --vac --vac-chunk-size 0.04 \
+  #       --min-chunk-size 0.9 \
+  #       --frame_threshold 15 \
+  #       --model_path large-v3 \
+  #       --warmup-file test.wav \
+  #       -l DEBUG 2>&1 | tee server_run.log
+  #
+  # --min-chunk-size and --frame_threshold are tuned, not arbitrary. --min-chunk-size must stay
+  # strictly BELOW streaming_interval in config/common.yaml (the server's gate is a strict >)
+  # -- see the constraint note there before changing either. --frame_threshold is justified
+  # above. Four traps when editing this command:
+  #   - Hyphens and underscores are genuinely mixed and argparse will not forgive a guess:
+  #     --min-chunk-size / --vac-chunk-size / --warmup-file / --log-level take hyphens,
+  #     --frame_threshold / --model_path / --static_init_prompt / --max_context_tokens take
+  #     underscores.
+  #   - --language is an alias of --lan (declared as "--lan, --language"), so either works;
+  #     a bare --help flag listing shows only --lan, which looks like this command is wrong.
+  #   - --fp16 is already the default, which is why it does not appear. Only --no-fp16 (fp32,
+  #     ~3.5x slower per iteration) needs to be passed explicitly.
+  #   - -l DEBUG is load-bearing for measurement, not verbosity taste -- see the MEASUREMENT
+  #     TRAP note above.
+  # --static_init_prompt is deliberately ABSENT from the command above, and should stay
+  # absent: it is a per-recording tool, not a setting. It names entities, so it is only
+  # correct for audio that actually contains them, and a prompt that does not match is
+  # measurably worse than no prompt at all -- see MISMATCHED PROMPT, MEASURED below, where
+  # the same file decoded with an unrelated prompt fabricated five words that three
+  # prompt-free replays of that file all got right. There is no content-independent version
+  # of this benefit, because what it buys is exactly the proper nouns that cannot be
+  # recovered from the audio alone.
+  #
+  # Set it per recording through stt.session_prompt above, NOT on the command line.
+  # The command-line flag was fixed for the whole process lifetime, so using it meant a
+  # measured 32.4s restart (launch to "Listening on", 32.4s on both runs, essentially all
+  # model load plus warmup) -- tolerable before a call, impossible between agenda items,
+  # which in practice meant never using it. The server now reads the prompt from a
+  # one-line header the client sends before the audio:
+  #
+  #       SSCFG1 {"static_init_prompt": "A discussion of ..."}\n
+  #
+  # This is free rather than clever: the prompt was never baked into the loaded weights.
+  # init_context() re-tokenizes cfg.static_init_prompt into a fresh context on every
+  # connection already (via refresh_segment(complete=True) from the per-connection
+  # init()), so the header just has to land before that call. It is also backward
+  # compatible in both directions -- the server recognizes the header only by its magic
+  # prefix and treats anything else as audio, so a plain-PCM client is unaffected, and a
+  # client sending a header to an older server merely adds a fraction of a second of
+  # noise. --no-session-config on the server ignores headers entirely.
+  # A command-line --static_init_prompt still works and becomes the default for any
+  # connection that sends no header. Note the reset semantics, which are the point:
+  # every connection is reset to the launch-time values for keys it does not set, so one
+  # recording's prompt can never leak into the next.
+  # Verified end to end at -l INFO: the connection that sends the header logs
+  # "[cfg] static_init_prompt: None -> 'A discussion of ...'", the next connection that
+  # sends none logs "[cfg] static_init_prompt: 'A discussion of ...' -> None", and the
+  # prompt text appears in zero emissions of either. The transition is logged rather than
+  # the value in force because the event worth seeing -- the previous connection's prompt
+  # being cleared for this one -- is invisible if only the current value is printed.
+  #
+  # What the flag does when the prompt DOES match, measured 2026-08-22: it is the only lever in
+  # this file that fixed an accuracy problem outright.
+  # All four terms that had failed in 4/4 previous runs came out correct in the run with the
+  # sentence-form prompt -- "ban" (was "back"), "Kimi" (was "Kimmy"), "MacKenzie" (was
+  # "McKenzie-Benzels'") and "Bezos" (was "Bezels") -- and it introduced no new errors. Of the
+  # 15 substitution regions against the no-prompt run, 4 are those fixes, 6 are pure
+  # word-splitting ("anybody"/"any body"), and 5 are function words. It also emitted 37 words
+  # the no-prompt run missed while dropping only 1, so it is more complete, not just tidier.
+  #
+  # DO NOT SHORTEN IT TO A LIST OF THE FAILING TERMS. That was tried, on the reasoning that
+  # only three terms had ever failed and that every character of permanent context costs
+  # something: "Kimi K3. MacKenzie Bezos. USAID." (33 chars) against the sentence above (95).
+  # It was worse in every way that could be measured, and it cost nothing to be wrong about
+  # because the run took five minutes:
+  #   - "Kimi K3" went back to "Give me K3", i.e. the exact failure the flag was added to fix.
+  #   - "I mean, you're hated" (~18s) became "I mean, you'll hate it" -- and that phrase was
+  #     correct in ALL FOUR no-prompt runs. The short prompt did not merely fail to help, it
+  #     broke something the flag was not even aimed at.
+  #   - It saved nothing. Normalized by audio duration the context-trim rate is identical:
+  #     1.01 trims/s with the 95-char prompt, 0.99 trims/s with the 33-char one. Prompt length
+  #     is not what drives trimming, so the whole rationale was void.
+  # The reason is the mechanism. "you're hated" shares no vocabulary at all with the sentence
+  # prompt, yet the sentence fixed it and the word list broke it, so this flag is not a
+  # terminology lookup -- it conditions the decoder's language model over the whole document.
+  # A fluent sentence on the actual topic conditions it usefully; a bare sequence of proper
+  # nouns apparently conditions it toward fragmentary output. Write any future prompt as a
+  # natural sentence describing the material, and do not prune it down to the words you
+  # happened to see fail.
+  # Two checks worth doing on the first run with any
+  # new prompt: Whisper sometimes emits prompt text as transcript (the 95-char version did
+  # not -- 0 occurrences of "a discussion of" or "mackenzie bezos" in the output), and a
+  # prompt can bias the model toward its own vocabulary. The way to rule the second one out is
+  # to look up the same timestamp in a no-prompt run, not to judge whether the sentence reads
+  # plausibly: "export controls" appeared in all four runs including the three without any
+  # prompt, and "USAID funding" appeared in the no-prompt runs as "USA ID funding", so the
+  # prompt changed that spelling but invented nothing.
+  #
+  # DETERMINISTIC A/B HARNESS. Every config comparison recorded above used a separate live
+  # capture, of a different length each time (137.8 / 151.4 / 160.2 / 172.2s), which is why
+  # several conclusions above had to be retracted: there was no way to separate a config
+  # effect from a capture-to-capture difference. Replaying one wav file instead is very
+  # nearly deterministic. Three connections streaming the same file at the same config
+  # produced word-identical transcripts -- 100.0% similarity and ZERO differing regions on
+  # all three pairs. The streaming path looks nondeterministic, since VAC decides on chunk
+  # arrival, but it is very nearly not, once the chunks arrive on a fixed cadence instead of
+  # from a live microphone. Two consequences, both large:
+  #   - The noise floor is at most one filler token, so ONE run per config is enough and any
+  #     difference beyond that is caused by the change. No repeat pairs, no drift correction,
+  #     no truncation to a common span -- none of the machinery the live-capture comparisons
+  #     above needed, and none of their ambiguity.
+  #   - Judge a config change this way BEFORE spending a live capture on it.
+  # NOISE FLOOR, MEASURED MORE CAREFULLY (2026-08-23): a later set of four connections of the
+  # same audio at the same config gave three word-identical transcripts (517 words) and one
+  # that dropped a single filler token ("ha") -- 99.9%, one region. All four consumed
+  # bit-identical audio, confirmed by dumping each connection's decoder input and comparing
+  # sample md5s, so the cause is chunk segmentation or decoding, not the audio. So the floor
+  # is not exactly zero: treat a one-filler-token difference as noise, and anything larger --
+  # a substitution, a fabricated span -- as caused by the change.
+  # The harness is test_session_client.py in the server checkout: it connects, optionally
+  # sends the SSCFG1 header, streams a wav as PCM16 in min-chunk-sized slices on a fixed
+  # 0.15s cadence, and prints the emissions. Diff two runs over lowercased,
+  # punctuation-stripped, apostrophe-rejoined words (difflib.SequenceMatcher, autojunk
+  # off), and parse the emission JSON lines only -- never grep the log for prompt terms,
+  # because the [cfg] and context records quote the prompt back and inflate every count.
+  #
+  # CAPTURING REAL AUDIO FOR THE HARNESS. The server takes --dump-audio-dir <dir> (off by
+  # default; nothing else in this pipeline writes audio to disk). Each connection then writes
+  # what the decoder consumed to conn-YYYYmmdd-HHMMSS.wav, 16 kHz mono PCM16 -- not what was
+  # captured: audio withheld during detected silence is absent and recording segments are
+  # spliced end to end, which is exactly what determines the transcript. Verified faithful --
+  # a dumped replay of test.wav had the same sample md5 as test.wav and reproduced its
+  # transcript word for word. Use it to turn a real session into a replayable A/B target,
+  # since test.wav is studio drama at 2.0 words/s and real material here runs about 3.0.
+  #
+  # MISMATCHED PROMPT, MEASURED. Same file, four connections: one carrying the Kimi K3 /
+  # USAID / MacKenzie Bezos sentence, three with no header. The audio was an unrelated
+  # office-English drama -- the realistic worst case, a prompt left over from an earlier
+  # meeting. Against the near-zero noise floor above, the prompt changed exactly six regions
+  # in 520 words, and the balance is negative:
+  #   - "end up trying to sell bananas" became "end up trying to celebrate my birthday,
+  #     I'll have bananas": five fabricated words, and all three prompt-free replays got
+  #     that phrase right.
+  #   - "I charmed them" became "I charged them"; "Fuzz Orange" became "False Orange".
+  #   - It also fixed one: "Betty actually spent hours" became the correct "I bet he
+  #     actually spent hours". A mismatched prompt is not uniformly destructive, which is
+  #     exactly what makes it easy to miss.
+  #   - The other two are nothing: "she's spending"/"she spends", and a dropped "um".
+  # So the cost of leaving a stale session_prompt in place is real but quiet -- no crash and
+  # no garbage, just a few confidently wrong words. That is what the reset semantics are
+  # for: a connection sending no header goes back to the launch defaults, so this failure
+  # mode takes actively setting a stale prompt, not merely forgetting to clear one.
+  #
+  # LATENCY: the prompt does not measurably cost any, and the two-step way that conclusion was
+  # reached is worth keeping, because both wrong answers looked convincing. --static_init_prompt
+  # does raise the context floor enough that trim_context() goes from 0 calls to one per
+  # emission. Raw numbers then made it look like a 5x tail regression (p90 1.13s -> 3.02s).
+  # That was mostly an artifact: (emission_time - word_start) also grows whenever VAC trims
+  # silence, because audio position then advances slower than the wall clock, so the metric
+  # drifts upward across a run on its own. Fitting and removing that linear drift left what
+  # looked like a real 2.2x residual (p90-p50 spread 0.467s -> 1.029s). That was ALSO wrong.
+  # The short-prompt run has the same trim rate as the long one and its corrected spread is
+  # 0.469s, i.e. indistinguishable from the no-prompt run's 0.467s. So the trim volume is not
+  # what moved the spread, and the one run that looked slow simply had non-linear drift that a
+  # straight-line fit could not absorb -- note its drift was +17.04 ms/s at R^2 0.50, versus
+  # +3.94 at 0.15 and +1.53 at 0.06 for the other two. process_iter p50 across the three runs
+  # is 0.206 / 0.221 / 0.218s, which is the whole real cost. Lesson: a linear drift correction
+  # with a mediocre R^2 does not license a latency claim; get a second run at the same config
+  # before believing a tail difference.
+  # Absolute end-to-end latency is NOT recoverable from the server log alone -- emission_time
+  # is wall-clock seconds since the connection, not an audio position, so subtracting its own
+  # median is circular and yields a meaningless ~0. Do not repeat that mistake; use the client
+  # log's per-segment T0 alignment for absolute numbers.
+  # Part of the cost was pure waste and has been removed upstream: trim_context() logged
+  # "Trimming context", the entire context text and the entire post-trim context at INFO, so
+  # production runs rebuilt the whole context string three times per emission for nothing.
+  # Those are now DEBUG, and the two that interpolate the context are additionally guarded by
+  # isEnabledFor so the string is not built when the record would be discarded. Confirmed on a
+  # later run at -l INFO: all three records appear zero times, where a prompt-carrying run
+  # previously produced about 153 of each.
+  #
+  # MECHANISM, verified in the source rather than assumed: the flag is trim-exempt and the
+  # exemption is implemented correctly. trim_context() passes
+  # `after = len(static_init_prompt)` to TokenBuffer.trim_words(after=), whose contract is
+  # "how many CHARACTERS to skip (length of the static prompt)" -- the units agree, so this is
+  # not the characters-used-as-token-count bug it looks like, and the prompt does survive to
+  # the 127s mark (which is how the surname got fixed). An over-long prompt cannot hang the
+  # server -- the trim loop breaks when trim_words returns 0 rather than spinning -- and it is
+  # cheaper than it looks: max_context_tokens defaults to None (upstream's help text saying
+  # "Default is 0" is wrong) and None means max_text_len, so the prompt does permanently
+  # occupy part of that budget and does force a trim on every emission, but the trim rate is
+  # 1.01/s at 95 chars and 0.99/s at 33, so within the range worth writing the length is not
+  # what drives it. Write the prompt at whatever length describes the material; do not trim it
+  # for cost, and specifically do not trim it down to a list of names.
 
 # Fields identical across all modes (sample_rate/channels/block_duration/
 # min_record_duration/streaming_enabled/streaming_interval, ai.provider/model/
@@ -30,8 +353,14 @@ audio:
   # so the client no longer needs to force-cut at a fixed duration (the old value of 7 was meant to
   # bound single-inference time for local inference -- keeping that limit now would send is_final=True
   # to the server mid-sentence, interrupting its continuous decoding state and cutting sentences in half).
-  # This is only a safety net for extreme cases (server error/disconnect) to keep the buffer from
-  # growing unbounded; under normal conditions it is almost never triggered.
+  # This is NOT the rare safety net an earlier version of this comment claimed it was. On the
+  # 2026-08-21 run it fired twice in 162s of audio and was the primary segmentation mechanism:
+  # the four segments were 60.5 + 60.5 + 20.0 + 21.0s, and only the last two came from pause
+  # detection. That turns out to be harmless rather than a bug -- hitting this limit resets the
+  # client's send position WITHOUT sending is_final, so the server's continuous decoding state
+  # is left intact, and the audio accounting stayed exact (client sent 162.000s, server
+  # received 162.000s; nothing dropped, nothing resent). Keep the limit as a bound on
+  # unbounded buffer growth if the server stalls, but do not assume it is inert.
   max_record_duration: 60
   input_device: null
   loopback_device: null          # loopback device name (soundcard speaker name), null = auto-use default speaker

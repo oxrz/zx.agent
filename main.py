@@ -263,7 +263,27 @@ class ZxAgent:
             sources=sources,
             on_result=self._on_remote_result,
             sample_rate=self.config.get("audio", {}).get("sample_rate", 16000),
+            # Per-recording decoder conditioning. Empty by default and meant to stay
+            # that way for everyday use: it only helps when it describes the audio at
+            # hand. Set it before a call whose subject and names are known. See the
+            # stt.session_prompt notes in config/trans.yaml.
+            session_prompt=self._resolve_env_var(stt_config.get("session_prompt", "")) or None,
+            # Late-bound on purpose: _init_listener() runs after this, so
+            # self.listener does not exist yet. The callback is only ever invoked
+            # from the STT client's keepalive thread, long after both exist.
+            # It reports False until listener.start(), which is correct -- there is
+            # nothing to keep a connection alive for before capture is running.
+            is_healthy=self._capture_is_healthy,
         )
+
+    def _capture_is_healthy(self) -> bool:
+        """Whether audio capture is currently working. Gates the STT keepalive so a
+        client whose capture died stops holding the (one-client-at-a-time) recognition
+        server open -- see RemoteSTTClient._keepalive_loop."""
+        listener = getattr(self, "listener", None)
+        if listener is None:
+            return False
+        return listener.is_capture_alive()
 
     def _init_llm(self):
         ai_config = self.config.get("ai", {})
@@ -320,7 +340,7 @@ class ZxAgent:
         if self._gui_override is not None:
             enabled = self._gui_override
         host = display_config.get("host", "127.0.0.1")
-        port = display_config.get("port", 8765)
+        port = display_config.get("port", 18765)
 
         self._gui_process = None
         if enabled and self._gui_auto_launch:
