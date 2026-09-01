@@ -126,8 +126,9 @@ stt:
   # instrumentation that is logged at DEBUG. Running the server with -l INFO keeps the JSON
   # emission lines (so transcripts and word timings survive) but silently discards all of
   # that, so any run you intend to measure must use -l DEBUG.
-  server_host: "${STT_SERVER_HOST}"    # remote recognition service LAN address, see .env
-  server_port: "${STT_SERVER_PORT}"    # port simulstreaming_whisper_server.py listens on, see .env
+  server_host: "10.42.1.11"    # rzp Arc B50 (whisper.cpp stream_server, Vulkan)
+  server_port: 9000            # TCP stream_server (raw PCM16 in, JSON Lines out)
+  send_header: false            # stream_server doesn't use SESSION_HEADER_MAGIC
   language: "en"              # already fixed to --language en on the server side; here for documentation only
   # Optional description of what is about to be recorded, sent to the server once per
   # connection (audio/stt.py _send_session_header) so it conditions the decoder on it.

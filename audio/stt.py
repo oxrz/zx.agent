@@ -64,6 +64,7 @@ class RemoteSTTClient:
         keepalive_interval: float = 60.0,
         is_healthy=None,
         session_prompt: str | None = None,
+        send_header: bool = True,
     ):
         """
         Args:
@@ -103,6 +104,7 @@ class RemoteSTTClient:
         self.keepalive_interval = keepalive_interval
         self.is_healthy = is_healthy
         self.session_prompt = session_prompt or None
+        self.send_header = send_header
 
         self._sock: socket.socket | None = None
         self._send_lock = threading.Lock()
@@ -153,11 +155,8 @@ class RemoteSTTClient:
                 )
                 sock.settimeout(None)  # subsequent reads can block; we rely on the peer closing/erroring to exit
                 with self._send_lock:
-                    # The header must be the first bytes on this connection, so send it
-                    # while self._sock is still None: send_incremental and the keepalive
-                    # both bail out on a None socket, which is what stops either of them
-                    # from putting audio in front of the header.
-                    self._send_session_header(sock)
+                    if self.send_header:
+                        self._send_session_header(sock)
                     self._sock = sock
                     self._sent_samples = 0
                     # Count the keepalive window from the moment we connect, not from
@@ -395,7 +394,7 @@ class SpeechRecognizer:
     """
 
     def __init__(self, sources: dict[str, tuple[str, int]], on_result=None, sample_rate: int = 16000,
-                 is_healthy=None, session_prompt: str | None = None):
+                 is_healthy=None, session_prompt: str | None = None, send_header: bool = True):
         """
         Args:
             sources: {source_name: (host, port)}, e.g. {"loopback": ("<remote recognition service address>", 45678)}
@@ -406,12 +405,16 @@ class SpeechRecognizer:
                        (see RemoteSTTClient._keepalive_loop)
             session_prompt: optional description of what is being recorded, forwarded
                        to every connection (see RemoteSTTClient)
+            send_header: whether to send a per-connection configuration header on connect.
+                       Set to False when connecting to servers that don't support the
+                       SESSION_HEADER_MAGIC protocol (e.g. whisper.cpp stream_server).
         """
         self.sample_rate = sample_rate
         self._clients: dict[str, RemoteSTTClient] = {
             source: RemoteSTTClient(
                 host=host, port=port, source=source, on_result=on_result, sample_rate=sample_rate,
                 is_healthy=is_healthy, session_prompt=session_prompt,
+                send_header=send_header,
             )
             for source, (host, port) in sources.items()
         }
