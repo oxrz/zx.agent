@@ -26,7 +26,8 @@ from display_protocol import DEFAULT_HOST, DEFAULT_PORT
 
 
 class DisplayReceiver(QObject):
-    transcript_received = pyqtSignal(str, str, bool)   # text, source, is_final
+    transcript_received = pyqtSignal(str, str, bool, bool, object, object)
+    # text, source, is_final, pending_correction, utterance_id, replace_utterance_id
     answer_chunk_received = pyqtSignal(str, bool)       # text, done
     status_received = pyqtSignal(str, str)              # state, detail
     clear_received = pyqtSignal(str)                    # target
@@ -116,7 +117,9 @@ class DisplayReceiver(QObject):
         msg_type = msg.get("type")
         if msg_type == "transcript":
             self.transcript_received.emit(
-                msg.get("text", ""), msg.get("source", ""), bool(msg.get("is_final"))
+                msg.get("text", ""), msg.get("source", ""),
+                bool(msg.get("is_final")), bool(msg.get("pending_correction", False)),
+                msg.get("utterance_id"), msg.get("replace_utterance_id"),
             )
         elif msg_type == "answer_chunk":
             self.answer_chunk_received.emit(msg.get("text", ""), bool(msg.get("done")))

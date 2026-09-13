@@ -7,18 +7,17 @@
 mode: "transcribe"
 
 stt:
-  # Remote speech recognition service (the same dedicated GPU server running
-  # SimulStreaming + Whisper large-v3 + AlignAtt streaming decoding), connecting to
-  # the same service instance as trans.yaml. This version of the client statically
+  # Remote ASR POC WebSocket service (Zipformer2 partial + OpenVINO Whisper final
+  # + CT2 CPU fallback), connecting to the same instance as trans.yaml. This version
+  # of the client statically
   # registers either mic or loopback at startup (see audio.mix_mode); it does not
   # support connecting both sources to the remote service in the same process (the
-  # server currently handles one connection at a time sequentially, see
-  # whisper_server.py). If you need to transcribe meeting audio and recognize the
+  # server session is created per client. If you need to transcribe meeting audio and recognize the
   # microphone at the same time, run two separate client processes with different
   # --config files.
   server_host: "${STT_SERVER_HOST}"    # remote recognition service LAN address, see .env
-  server_port: "${STT_SERVER_PORT}"    # port simulstreaming_whisper_server.py listens on, see .env
-  language: "en"              # already fixed to --language en on the server side; here for documentation only
+  server_port: "${STT_SERVER_PORT}"    # ASR POC WebSocket port, see .env
+  language: "en"              # server currently recognizes English; retained for config compatibility
 
 # Fields identical across all modes (sample_rate/channels/block_duration/
 # min_record_duration/streaming_enabled/streaming_interval, ai.provider/model/

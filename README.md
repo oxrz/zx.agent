@@ -2,7 +2,7 @@
 
 > **Always-on microphone/system audio capture -> remote streaming speech recognition (English only) -> real-time text output / Q&A assistance**
 
-A voice assistant for meeting/video scenarios: transcribes English speech in real time, or detects questions and answers them with a bilingual (Chinese/English) explanation using recent context. Speech recognition does not run locally -- the client connects to a remote SimulStreaming service (a dedicated GPU server running Whisper large-v3 + AlignAtt streaming decoding).
+A voice assistant for meeting/video scenarios: transcribes English speech in real time, or detects questions and answers them with a bilingual (Chinese/English) explanation using recent context. Speech recognition does not run locally -- the client connects to the ASR POC on `rzp`, which combines Zipformer2 streaming partials with OpenVINO Whisper final correction and a CT2 CPU fallback.
 
 ---
 
@@ -38,7 +38,7 @@ Both modes **only recognize English** (`stt.language: "en"`) - no Chinese recogn
 ├── audio/
 │   ├── __init__.py
 │   ├── capture_process.py     # Independent subprocess: mic + WASAPI loopback capture, streaming sliding-window segmentation
-│   ├── stt.py                 # Remote speech recognition client (TCP connection to the SimulStreaming service, sends/receives incremental results)
+│   ├── stt.py                 # Remote WebSocket speech recognition client (PCM16 frames, partial/final results)
 │   └── tts.py                 # Text-to-speech (edge-tts / gTTS, optional)
 ├── ai/
 │   ├── __init__.py
@@ -57,11 +57,11 @@ Both modes **only recognize English** (`stt.language: "en"`) - no Chinese recogn
 ```
 +--------------------------------+          +-----------------------------------+
 |              Client            |          |      Remote GPU Server            |
-|                                |  TCP     |                                   |
+|                                | WebSocket|                                   |
 | +--------------+  +----------+ | audio--> |  +------------------------------+ |
-| | Audio capture|->| Remote STT | +--------+->| SimulStreaming               | |
-| | mic+loopback |  | client     | | <-incr |  | Whisper large-v3 + AlignAtt  | |
-| | own process  |  |(stt.py)    | | JSONL  |  | automatic VAC segmentation   | |
+| | Audio capture|->| Remote STT | +--------+->| Zipformer2 streaming         | |
+| | mic+loopback |  | client     | | <-JSON |  | OpenVINO Whisper final       | |
+| | own process  |  |(stt.py)    | |  text  |  | CT2 CPU fallback             | |
 | +--------------+  +-----+------+ |        |  +------------------------------+ |
 |                         |        |        +-----------------------------------+
 |              +----------v--------+
@@ -82,9 +82,9 @@ Both modes **only recognize English** (`stt.language: "en"`) - no Chinese recogn
 
 The client no longer loads any model locally. The dedicated audio capture subprocess only captures, segments, and forwards audio incrementally:
 
-- `audio/capture_process.py` keeps growing the buffer for the current utterance using its existing sliding-window logic. When `streaming_enabled` is on, it fires a callback with the current buffer every `streaming_interval` seconds (default 1s), with `is_final=False`.
-- `audio/stt.py`'s `RemoteSTTClient` receives the buffer and only sends the PCM16 audio that is new since the last send - it never resends the whole buffer (the server keeps its own audio state; it's not stateless inference).
-- The remote SimulStreaming service uses VAC (voice activity detection) + the AlignAtt strategy to do true streaming incremental decoding. Results are streamed back as line-delimited JSON (JSONL): the `text` field is the newly confirmed text increment, and `is_final` marks whether this utterance has ended.
+- `audio/capture_process.py` keeps growing the buffer for the current utterance using its sliding-window logic. When `streaming_enabled` is on, it fires a callback with the current buffer every `streaming_interval` seconds, with `is_final=False`.
+- `audio/stt.py`'s `RemoteSTTClient` connects to `ws://<server>:45678/v1/stream`, sends the start handshake, and only sends PCM16 samples that are new since the last send. Each binary frame has a 12-byte little-endian sequence/timestamp header.
+- The ASR POC on `rzp` runs Zipformer2 on CPU for low-latency partial text. On endpoint it queues the buffered utterance for OpenVINO Whisper on the Arc GPU; if that fails, faster-whisper CT2 on CPU produces the final result. Responses are WebSocket JSON messages (`ready`, `partial`, `final`, `closed`).
 - `max_record_duration` (default 60s) is only a client-side safety net, to keep the buffer from growing unbounded if the server misbehaves or disconnects. Under normal conditions, segmentation is entirely driven by the server's VAC and this value is never hit.
 
 In `transcribe` mode, incoming incremental text is printed directly as it streams in (live-subtitle effect). In `assist` mode, confirmed text from the loopback source is stored in the rolling context for use when answering later questions.
@@ -95,7 +95,7 @@ In `transcribe` mode, incoming incremental text is printed directly as it stream
 
 ### Known Limitations
 
-- **Microphone (mic) question recognition is not implemented yet**: by design, mic audio is meant to be processed locally (it does not go through the remote recognition service, which is dedicated to meeting/other-party audio), but the local recognition approach is still being designed. In the current code, mic audio is captured but never forwarded to any recognition path. The mic-related recognition settings in `config/assist.yaml` are kept in their old format as placeholders until the local recognition approach is finalized.
+- **Microphone question recognition in assist mode is not implemented yet**: assist mode captures the microphone for future question detection, but the current `main.py` registers only the loopback source with the remote ASR session. Use `config/mic.yaml` in a separate process when the microphone itself needs to be transcribed.
 
 ---
 
@@ -106,7 +106,7 @@ In `transcribe` mode, incoming incremental text is printed directly as it stream
 | Component | Technology | Notes |
 |-----------|-----------|-------|
 | **Audio capture** | `sounddevice` + `soundcard` | Microphone + WASAPI loopback (system audio), isolated in its own subprocess |
-| **Speech recognition (STT)** | Remote SimulStreaming service (TCP client) | Whisper large-v3 + AlignAtt streaming decoding, deployed on a dedicated GPU server; the client only captures/forwards/displays, with no local inference dependency |
+| **Speech recognition (STT)** | Remote WebSocket client | `rzp:45678` ASR POC: Zipformer2 CPU partials, OpenVINO Whisper GPU finalization, CT2 CPU fallback |
 | **AI / LLM** | `httpx` | Compatible with any OpenAI-style `/chat/completions` endpoint (DeepSeek/OpenAI/Moonshot/etc.); `provider` is only a logging label, not tied to a specific vendor |
 | **Text-to-speech (TTS)** | `edge-tts` / `gTTS` | Optional |
 | **Configuration** | `PyYAML` + `.env` | Structured config lives in YAML; sensitive/environment-specific values (server address, API keys) come from environment variables |
@@ -131,7 +131,7 @@ pip install -r requirements.txt
 ```bash
 cp .env.example .env
 # Edit .env and fill in:
-#   STT_SERVER_HOST / STT_SERVER_PORT - remote SimulStreaming service address
+#   STT_SERVER_HOST / STT_SERVER_PORT - remote ASR POC WebSocket address (default port 45678)
 #   AI_PROVIDER / AI_MODEL / AI_API_BASE / AI_API_KEY - LLM service config (needed for assist mode)
 ```
 
@@ -153,6 +153,19 @@ python main.py --list-devices
 # temporarily override the log level (no need to edit the yaml)
 python main.py -v DEBUG
 ```
+
+With `-v DEBUG`, stdout/stderr are also duplicated to `logs/agent-terminal.output`.
+When the GUI is enabled with `-g`, the GUI process records the text actually rendered
+in each pane as JSONL snapshots in `logs/agent-gui.output` (including transcript
+history/current partial text, answer text, status, and clear operations). This is
+the final GUI presentation, after queued events have been applied by the overlay.
+The agent-side events sent into the GUI queue are recorded separately as JSONL in
+`logs/agent-gui.events`, so transport/queue loss can be compared with the final
+render snapshots.
+
+The client also guards final replacements: if a delayed Whisper final is an
+obvious suffix/fragment of the saved Zipformer partial, or a repeated-character
+hallucination, it is rejected so it cannot erase a more complete sentence.
 
 ### 4. Exit
 

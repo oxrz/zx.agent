@@ -176,7 +176,11 @@ def main():
         height=args.height,
         opacity=args.opacity,
         theme=args.theme,
+        output_path=os.environ.get("AGENTIC_GUI_OUTPUT_PATH"),
     )
+    # Ensure the render-snapshot file is flushed when the process exits.  Do
+    # not close it from OverlayWindow.closeEvent: Hide also emits that event.
+    app.aboutToQuit.connect(window.close_output_recorder)
     window.show()
 
     if QSystemTrayIcon.isSystemTrayAvailable():
