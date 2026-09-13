@@ -37,6 +37,10 @@ from audio.tts import TextToSpeech
 from ai.llm import LLMClient, LLMConfig
 from memory import ContextBuffer
 from gui.publisher import DisplayPublisher
+from utils.output_record import OutputRecorder, TeeTextIO
+
+
+_GUI_LAUNCH_TOKEN_ENV = "AGENTIC_GUI_LAUNCH_TOKEN"
 
 
 def set_high_performance():
@@ -88,7 +92,8 @@ def load_env_file(env_path=None):
 
 class ZxAgent:
     def __init__(self, config_path="config/trans.yaml", log_level_override=None,
-                 gui_override=None, gui_auto_launch=False):
+                 gui_override=None, gui_auto_launch=False, gui_output_path=None,
+                 gui_event_recorder=None):
         self.config = self._load_config(config_path)
         self._running = False
         # The CLI's --gui/-g takes priority over the config file's display.enabled,
@@ -99,6 +104,12 @@ class ZxAgent:
         # child process if nothing is already listening, so a single command
         # starts both the agent and the overlay window.
         self._gui_auto_launch = gui_auto_launch
+        # The GUI owns this file: it records the text after the overlay applies
+        # each incoming event to its state and renders the visible snapshot.
+        self._gui_output_path = gui_output_path
+        # The agent-side event stream is kept separately so it can be compared
+        # with the GUI process's final render snapshots during debugging.
+        self._gui_event_recorder = gui_event_recorder
 
         # The CLI's --log-level/-v takes priority over the config file's logging.level,
         # for quick ad-hoc debugging (e.g. to see how often partials get skipped /
@@ -129,10 +140,9 @@ class ZxAgent:
         )
         self._loop_thread.start()
 
-        # Remote recognition results are now confirmed incrementally natively by the
-        # server (SimulStreaming + AlignAtt), so the client no longer needs to
-        # maintain its own local-agreement state or serialize local inference calls
-        # with a lock.
+        # Remote recognition results arrive incrementally from the ASR POC:
+        # Zipformer supplies partial text and the server later sends an OpenVINO
+        # Whisper final correction (with CT2 CPU fallback if GPU finalization fails).
         # Tracks, per source, whether this utterance has already triggered the LLM
         # early because an incremental result ended in a question mark, so we don't
         # trigger it again once the utterance ends (is_final).
@@ -147,9 +157,12 @@ class ZxAgent:
         # whenever is_final=True closes out an utterance.
         self._transcript_accum = {"mic": "", "loopback": ""}
         # transcribe mode only: how much of the case-normalized full_text has
-        # already been printed to the terminal for each source, so only the
-        # newly-added tail gets printed on each update (see _on_remote_result).
+        # already been printed to the terminal for each source.  The companion
+        # snapshot is needed because Zipformer can revise text in the middle of
+        # an utterance; a character-length-only check would duplicate the
+        # revised prefix in the terminal.
         self._transcript_printed_len = {"mic": 0, "loopback": 0}
+        self._transcript_printed_text = {"mic": "", "loopback": ""}
 
         self._init_stt()
         self._init_llm()
@@ -224,16 +237,14 @@ class ZxAgent:
         return value
 
     def _init_stt(self):
-        """Remote speech recognition client: connects to the SimulStreaming service on
-        a dedicated GPU server, keeps streaming audio, and receives incremental
-        recognition results via the _on_remote_result callback.
-        No longer loads any model locally, and no longer needs _stt_lock /
-        local-agreement to simulate streaming.
+        """Initialize the WebSocket client for the remote ASR POC on rzp.
+        Audio is sent as incremental PCM16 frames; results arrive through
+        _on_remote_result as Zipformer partials followed by Whisper finals.
+        The client loads no speech model locally.
 
         This version only supports registering a single audio source at startup; it
         does not support connecting both mic and loopback to the remote service in
-        the same process (the server currently handles one connection at a time
-        sequentially, see whisper_server.py). Which source gets registered is decided
+        the same process. Which source gets registered is decided
         by audio.mix_mode:
           mix_mode: "mic"      -> registers "mic" (capture_process only captures the microphone)
           mix_mode: "loopback" -> registers "loopback" (capture_process only captures system audio)
@@ -337,16 +348,24 @@ class ZxAgent:
             height = display_config.get("height")
             opacity = display_config.get("opacity")
             theme = display_config.get("theme")
-            self._gui_process = self._maybe_launch_gui(host, port, width, height, opacity, theme)
+            self._gui_process = self._maybe_launch_gui(
+                host, port, width, height, opacity, theme, self._gui_output_path
+            )
+            if self._gui_process is not None:
+                self._wait_for_gui_ready(host, port)
 
         self.display = DisplayPublisher(
             enabled=enabled,
             host=host,
             port=port,
             logger=logger,
+            output_recorder=self._gui_event_recorder,
         )
+        if self._gui_process is not None:
+            self.display.connect_now()
 
-    def _maybe_launch_gui(self, host, port, width=None, height=None, opacity=None, theme=None):
+    def _maybe_launch_gui(self, host, port, width=None, height=None, opacity=None,
+                          theme=None, output_path=None):
         """Launch `python -m gui.app` as a child process, unless something is
         already listening on host:port (e.g. the user started the GUI manually
         in another terminal -- don't spawn a second, redundant overlay window).
@@ -381,6 +400,8 @@ class ZxAgent:
 
         env = dict(os.environ)
         env[_GUI_LAUNCH_TOKEN_ENV] = "1"
+        if output_path:
+            env["AGENTIC_GUI_OUTPUT_PATH"] = str(output_path)
 
         try:
             proc = subprocess.Popen(cmd, cwd=str(Path(__file__).resolve().parent), env=env)
@@ -390,6 +411,21 @@ class ZxAgent:
         except Exception as e:
             logger.warning(f"Failed to auto-launch GUI overlay: {e}")
             return None
+
+    def _wait_for_gui_ready(self, host: str, port: int, timeout: float = 30.0):
+        """Block until the GUI overlay's TCP listener is accepting connections."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                with socket.create_connection((host, port), timeout=0.5):
+                    logger.info(f"GUI overlay ready on {host}:{port}")
+                    return
+            except OSError:
+                time.sleep(0.3)
+        logger.warning(
+            f"GUI overlay did not become ready on {host}:{port} "
+            f"within {timeout}s — continuing without waiting"
+        )
 
     def _start_gui_monitor(self, proc):
         """Since --gui/-g explicitly asked to pair the agent with a GUI
@@ -446,10 +482,9 @@ class ZxAgent:
                   mid-utterance chunk in streaming mode (the buffer is still growing).
 
         No longer calls model inference locally -- just forwards the current
-        (incremental) audio to the remote recognition service; the actual recognition
-        result arrives asynchronously via the _on_remote_result callback (the server's
-        AlignAtt natively confirms increments, so the client doesn't need to simulate
-        local-agreement itself).
+        (incremental) audio to the remote ASR POC; recognition results arrive
+        asynchronously via _on_remote_result (Zipformer partials followed by
+        an OpenVINO Whisper final, with CT2 fallback on the server).
 
         Only forwards the one source registered at startup (self._audio_source,
         decided by audio.mix_mode); the other source is ignored (under normal
@@ -548,10 +583,10 @@ class ZxAgent:
         """Callback for incremental results from the remote recognition service
         (invoked on the STT client's reader thread).
 
-        result fields (per SimulStreaming's whisper_server.py protocol):
-          text     : the newly confirmed text increment for this update (not the
-                     full text accumulated from the start)
-          is_final : whether this marks the end of an utterance (server-side VAC-detected silence)
+        result fields (mapped from the ASR POC WebSocket protocol):
+          text     : the newly confirmed text increment for this update
+          full_text: authoritative text for the current utterance when supplied
+          is_final : whether this marks the end of an utterance
 
         transcribe mode: incremental text is printed directly, for a live-subtitle
         effect; a newline is printed on is_final.
@@ -560,61 +595,76 @@ class ZxAgent:
         """
         delta = result.get("text", "")
         is_final = result.get("is_final", False)
+        pending_correction = result.get("pending_correction", False)
+        utterance_id = result.get("utterance_id")
+        replace_utterance_id = result.get("replace_utterance_id", utterance_id)
 
-        # `delta` is only the newly confirmed increment for this update (see
-        # audio/stt.py) -- accumulate the RAW (un-normalized) delta here, then
-        # recompute the case-normalized full text from scratch every time (see
-        # _degrade_all_caps_runs) rather than normalizing delta-by-delta. This
-        # matters because a genuine all-caps run can span a delta boundary
-        # (see that method's docstring) -- normalizing only the current delta
-        # in isolation could see fewer than _CAPS_RUN_THRESHOLD caps words and
-        # wrongly leave a real run untouched.
-        if delta:
+        # pending_correction=True means this is a Whisper final for an utterance
+        # that already transitioned (uid advanced past current). Don't touch
+        # _transcript_accum or _transcript_printed_len — those track the CURRENT
+        # Zipformer stream and must not be disrupted by late-arriving corrections.
+        if pending_correction and is_final:
+            display_text = result.get("full_text", "")
+            if display_text:
+                display_text = self._degrade_all_caps_runs(display_text)
+                display_text = self._capitalize_first_letter(display_text)
+                self.display.transcript(
+                    display_text, source, True, pending_correction=True,
+                    utterance_id=utterance_id,
+                    replace_utterance_id=replace_utterance_id,
+                )
+                if self.mode == "transcribe":
+                    print(display_text, flush=True)
+                    print(flush=True)
+                elif source == "loopback":
+                    self.context.add(display_text, source="loopback")
+            return
+
+        # Normal path: partial or current-utterance final.
+        full_text_received = result.get("full_text")
+        if full_text_received is not None:
+            self._transcript_accum[source] = full_text_received
+        elif delta:
             self._transcript_accum[source] += delta
         full_text = self._degrade_all_caps_runs(self._transcript_accum[source])
         full_text = self._capitalize_first_letter(full_text)
 
         if self.mode == "transcribe":
-            if delta:
-                # Only print the portion of the normalized text that is new
-                # since the last update, to preserve the incremental
-                # live-subtitle printing effect. Case-folding never changes
-                # string length, so this offset stays valid even if an
-                # earlier (already-printed) word's case is retroactively
-                # corrected by a run that only became long enough on this
-                # update -- the terminal just keeps whatever case it already
-                # printed for that word (a minor, rare, cosmetic-only gap;
-                # the GUI/LLM/context below always see the fully corrected
-                # text, since they're sent the complete current string each
-                # time rather than a diff).
-                printed_len = self._transcript_printed_len[source]
-                print(full_text[printed_len:], end="", flush=True)
-                self._transcript_printed_len[source] = len(full_text)
-            # `delta or is_final`, not just `delta`: the remote service's
-            # final update for an utterance often carries no new text at all
-            # (everything was already confirmed in earlier partial updates --
-            # this is-final message is purely "this utterance is now over").
-            # Gating the GUI push on `delta` alone meant the GUI never learned
-            # is_final=True for those utterances -- it stayed sitting in
-            # _transcript_partial (see OverlayWindow._on_transcript) and got
-            # silently overwritten the moment the NEXT utterance's first
-            # partial arrived, i.e. the whole utterance visibly vanished from
-            # the GUI even though the terminal (which prints incrementally as
-            # deltas arrive, independent of this call) showed it correctly.
+            printed_text = self._transcript_printed_text[source]
+            if full_text.startswith(printed_text):
+                # Normal append-only update: print only the new tail.
+                delta_to_print = full_text[len(printed_text):]
+                if delta_to_print:
+                    print(delta_to_print, end="", flush=True)
+            elif full_text:
+                # Recognition revision: the terminal cannot safely edit an
+                # already wrapped line, so start a clean snapshot on a new
+                # line instead of concatenating unrelated prefixes.
+                if printed_text:
+                    print(flush=True)
+                print(full_text, end="", flush=True)
+            self._transcript_printed_text[source] = full_text
+            self._transcript_printed_len[source] = len(full_text)
             if delta or is_final:
-                self.display.transcript(full_text, source, is_final)
+                self.display.transcript(
+                    full_text, source, is_final,
+                    utterance_id=utterance_id,
+                    replace_utterance_id=replace_utterance_id,
+                )
             if is_final:
                 print(flush=True)
                 self._transcript_accum[source] = ""
                 self._transcript_printed_len[source] = 0
+                self._transcript_printed_text[source] = ""
             return
 
         # assist mode
-        # Same `delta or is_final` fix as transcribe mode above -- otherwise
-        # an utterance whose final update carries no new text never reaches
-        # the GUI as a completed line.
         if delta or is_final:
-            self.display.transcript(full_text, source, is_final)
+            self.display.transcript(
+                full_text, source, is_final,
+                utterance_id=utterance_id,
+                replace_utterance_id=replace_utterance_id,
+            )
             if source == "mic" and delta:
                 if not self._question_fired[source] and full_text.strip().endswith("?"):
                     self._question_fired[source] = True
@@ -799,16 +849,39 @@ def main():
         list_audio_devices()
         return
 
-    agent = ZxAgent(
-        config_path=args.config,
-        log_level_override=args.log_level,
-        gui_override=(True if args.gui else None),
-        gui_auto_launch=args.gui,
-    )
-    if args.once:
-        agent.run_once()
-    else:
-        agent.run()
+    terminal_recorder = None
+    gui_output_path = None
+    gui_event_recorder = None
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    if args.log_level == "DEBUG":
+        project_root = Path(__file__).resolve().parent
+        terminal_recorder = OutputRecorder(project_root / "logs/agent-terminal.output", mode="w")
+        gui_output_path = project_root / "logs/agent-gui.output"
+        gui_event_recorder = OutputRecorder(project_root / "logs/agent-gui.events", mode="w")
+        sys.stdout = TeeTextIO(original_stdout, terminal_recorder)
+        sys.stderr = TeeTextIO(original_stderr, terminal_recorder)
+
+    try:
+        agent = ZxAgent(
+            config_path=args.config,
+            log_level_override=args.log_level,
+            gui_override=(True if args.gui else None),
+            gui_auto_launch=args.gui,
+            gui_output_path=gui_output_path,
+            gui_event_recorder=gui_event_recorder,
+        )
+        if args.once:
+            agent.run_once()
+        else:
+            agent.run()
+    finally:
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        if terminal_recorder is not None:
+            terminal_recorder.close()
+        if gui_event_recorder is not None:
+            gui_event_recorder.close()
 
 
 if __name__ == "__main__":

@@ -6,9 +6,11 @@
 mode: "transcribe"
 
 stt:
-  # Remote speech recognition service (SimulStreaming + Whisper large-v3 + AlignAtt streaming decoding
-  # on a dedicated GPU server, AMD 7900XTX + ROCm 6.3 accelerated). No local model loading anymore --
+  # Remote ASR POC WebSocket service on rzp (Zipformer2 CPU partials, OpenVINO Whisper
+  # large-v3-turbo GPU final correction, faster-whisper CT2 CPU fallback). No local model loading --
   # the client only captures/forwards/displays audio.
+  # The long benchmark notes below are historical measurements from the retired
+  # streaming service; they do not describe the current server implementation.
   # Test finding (2026-07-23): local AMD iGPU (DirectML) inference of the medium model takes 5s+ per
   # 8s-audio segment, making streaming effectively useless, hence the move to a remote GPU server.
   # Measured on the server (2026-08-19, large-v3, 260s of speech, 173 iterations, VAD-like resets):
@@ -126,9 +128,9 @@ stt:
   # instrumentation that is logged at DEBUG. Running the server with -l INFO keeps the JSON
   # emission lines (so transcripts and word timings survive) but silently discards all of
   # that, so any run you intend to measure must use -l DEBUG.
-  server_host: "${STT_SERVER_HOST}"    # remote recognition service LAN address, see .env
-  server_port: "${STT_SERVER_PORT}"    # port simulstreaming_whisper_server.py listens on, see .env
-  language: "en"              # already fixed to --language en on the server side; here for documentation only
+  server_host: "${STT_SERVER_HOST}"  # rzp ASR POC address, loaded from .env
+  server_port: "${STT_SERVER_PORT}"  # WebSocket /v1/stream port, loaded from .env
+  language: "en"              # server currently recognizes English; retained for config compatibility
   # Optional description of what is about to be recorded, sent to the server once per
   # connection (audio/stt.py _send_session_header) so it conditions the decoder on it.
   # Empty is the right everyday value. It is worth filling in only when the subject and
@@ -137,12 +139,9 @@ stt:
   # as a natural sentence about the material, not a list of names. Example:
   #   session_prompt: "A discussion of Kimi K3, USAID funding, MacKenzie Bezos, and US export controls on China."
   session_prompt: ""
-  # The server is launched by hand and reads no config file, so its flags exist nowhere but
-  # the shell history unless they are written down -- and history is capped at 1000 lines, which
-  # already rotated the tuned invocations out once. The whole command, verified against
-  # --help on the box. Run it from the SimulStreaming checkout; the venv lives one level ABOVE
-  # that checkout rather than inside it, which is the only reason the interpreter path needs
-  # a ../ -- adjust both placeholders to wherever they actually sit:
+  # RETIRED SERVER NOTES (kept only as historical benchmark context): the command and flags
+  # in the comments below belonged to the former SimulStreaming server. The current server
+  # is /home/rz/ai/ASR/POC/run_python_server.sh on rzp and uses its own .uvenv.
   #
   #     cd <SimulStreaming checkout>
   #     ../<venv>/bin/python simulstreaming_whisper_server.py \
@@ -348,8 +347,8 @@ stt:
 audio:
   silence_threshold: 0.02        # baseline threshold, used for system-output (loopback) detection (multiplied by 0.5 internally, more sensitive)
   mic_silence_threshold: 0.05
-  silence_duration: 0.6          # English speech is faster-paced, so pause detection is more sensitive
-  # The remote SimulStreaming server has its own VAC + AlignAtt and segments on natural pauses,
+  silence_duration: 0.9          # English speech is faster-paced, so pause detection is more sensitive
+  # The rzp ASR POC has its own endpoint detection and segments on natural pauses,
   # so the client no longer needs to force-cut at a fixed duration (the old value of 7 was meant to
   # bound single-inference time for local inference -- keeping that limit now would send is_final=True
   # to the server mid-sentence, interrupting its continuous decoding state and cutting sentences in half).

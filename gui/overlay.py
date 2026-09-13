@@ -44,7 +44,7 @@ Design notes:
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor, QFont, QKeySequence, QPainter, QShortcut
+from PyQt6.QtGui import QColor, QFont, QKeySequence, QPainter, QShortcut, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
     QHBoxLayout,
@@ -57,6 +57,7 @@ from PyQt6.QtWidgets import (
 
 from gui.receiver import DisplayReceiver
 from gui.settings_window import SettingsWindow
+from utils.output_record import OutputRecorder
 
 _MAX_HISTORY_LINES = 50    # cap on confirmed transcript lines kept in memory/view
 _DEFAULT_WIDTH = 900
@@ -171,9 +172,18 @@ class _SelectableTextEdit(QPlainTextEdit):
         menu.exec(event.globalPos())
 
     def append_and_scroll(self, text: str):
-        self.setPlainText(text)
         scrollbar = self.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        at_bottom = scrollbar.value() >= scrollbar.maximum() - 10
+        self.setPlainText(text)
+        # setPlainText leaves cursor at end; Qt then forces a scroll to show
+        # the cursor.  Override: if the user has scrolled up, park the cursor
+        # at the document start so Qt has no reason to jump to the bottom.
+        cursor = self.textCursor()
+        if at_bottom:
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+        else:
+            cursor.movePosition(QTextCursor.MoveOperation.Start)
+        self.setTextCursor(cursor)
 
 
 class OverlayWindow(QWidget):
@@ -185,6 +195,7 @@ class OverlayWindow(QWidget):
         height: int = _DEFAULT_HEIGHT,
         opacity: int = _DEFAULT_OPACITY,
         theme: str = _DEFAULT_THEME,
+        output_path: str | None = None,
     ):
         super().__init__()
         self._drag_offset = None
@@ -205,11 +216,19 @@ class OverlayWindow(QWidget):
         # Confirmed (is_final=True) lines, oldest first, capped at
         # _MAX_HISTORY_LINES so the view keeps scrolling instead of growing forever.
         self._transcript_history: list[str] = []
+        # IDs parallel to _transcript_history.  A provisional Zipformer line is
+        # kept here when the next utterance starts, so its later Whisper final
+        # can replace it in place instead of appending a duplicate line.
+        self._transcript_history_ids: list[object] = []
         # Per-source text that hasn't been finalized yet (still being spoken/
         # recognized) -- shown as a trailing, still-updating line under the
         # confirmed history, replaced in place until it's finalized.
         self._transcript_partial: dict[str, str] = {"mic": "", "loopback": ""}
+        self._transcript_partial_ids: dict[str, object] = {"mic": None, "loopback": None}
         self._answer_text = ""
+        self._output_recorder = (
+            OutputRecorder(output_path, mode="w") if output_path else None
+        )
 
         self._setup_window()
         self._setup_ui()
@@ -444,45 +463,142 @@ class OverlayWindow(QWidget):
         "print a bare colon", so this must not always insert "": "."""
         return f"{label}: {text}" if label else text
 
-    def _render_transcript(self):
+    def _render_transcript(self, **metadata):
         lines = list(self._transcript_history)
         for source, partial in self._transcript_partial.items():
             if partial:
                 label = _SOURCE_LABELS.get(source, source)
                 lines.append(self._format_line(label, partial))
-        self._transcript_view.append_and_scroll("\n".join(lines))
+        rendered = "\n".join(lines)
+        self._transcript_view.append_and_scroll(rendered)
+        if self._output_recorder is not None:
+            record = {
+                "type": "render",
+                "pane": "transcript",
+                "text": rendered,
+            }
+            record.update({k: v for k, v in metadata.items() if v is not None})
+            self._output_recorder.event(record)
+
+    def _append_or_replace_history(self, text: str, uid, source: str):
+        """Store a confirmed/provisional line, replacing by utterance ID when possible."""
+        label = _SOURCE_LABELS.get(source, source)
+        rendered = self._format_line(label, text)
+        if uid is not None:
+            for i, history_uid in enumerate(self._transcript_history_ids):
+                if history_uid == uid:
+                    self._transcript_history[i] = rendered
+                    return
+        self._transcript_history.append(rendered)
+        self._transcript_history_ids.append(uid)
+        overflow = len(self._transcript_history) - _MAX_HISTORY_LINES
+        if overflow > 0:
+            del self._transcript_history[:overflow]
+            del self._transcript_history_ids[:overflow]
 
     # ---- DisplayReceiver signal handlers ----
-    def _on_transcript(self, text: str, source: str, is_final: bool):
+    def _on_transcript(
+        self, text: str, source: str, is_final: bool,
+        pending_correction: bool = False, utterance_id=None,
+        replace_utterance_id=None,
+    ):
+        source = source or "loopback"
         if is_final:
-            self._transcript_partial[source] = ""
-            if text:
-                label = _SOURCE_LABELS.get(source, source)
-                self._transcript_history.append(self._format_line(label, text))
-                overflow = len(self._transcript_history) - _MAX_HISTORY_LINES
-                if overflow > 0:
-                    del self._transcript_history[:overflow]
+            # pending_correction=True: Whisper final for an already-past utterance --
+            # leave the current in-progress partial untouched (a newer utterance is
+            # still streaming).  pending_correction=False: Whisper arrived while this
+            # was still the active utterance (user paused) -- clear the now-stale
+            # partial so the overlay doesn't double-show it alongside the history entry.
+            target_uid = replace_utterance_id if replace_utterance_id is not None else utterance_id
+            if text and target_uid is not None:
+                # A previous partial may have been promoted to history when a
+                # newer utterance started. Replace that line with the final.
+                self._append_or_replace_history(text, target_uid, source)
+            elif text:
+                self._append_or_replace_history(text, None, source)
+
+            if not pending_correction:
+                self._transcript_partial[source] = ""
+                self._transcript_partial_ids[source] = None
+            elif target_uid == self._transcript_partial_ids.get(source):
+                self._transcript_partial[source] = ""
+                self._transcript_partial_ids[source] = None
         else:
+            previous_uid = self._transcript_partial_ids.get(source)
+            if (
+                text and utterance_id is not None and previous_uid is not None
+                and utterance_id != previous_uid
+            ):
+                # Keep the old sentence visible until its delayed final arrives.
+                self._append_or_replace_history(
+                    self._transcript_partial[source], previous_uid, source
+                )
             self._transcript_partial[source] = text
-        self._render_transcript()
+            self._transcript_partial_ids[source] = utterance_id
+        self._render_transcript(
+            utterance_id=utterance_id,
+            replace_utterance_id=replace_utterance_id,
+            is_final=is_final,
+            pending_correction=pending_correction,
+        )
 
     def _on_answer_chunk(self, text: str, done: bool):
         if text:
             self._answer_text += text
             self._answer_view.append_and_scroll(self._answer_text)
+        if self._output_recorder is not None:
+            self._output_recorder.event({
+                "type": "render",
+                "pane": "answer",
+                "text": self._answer_text,
+                "done": done,
+            })
 
     def _on_status(self, state: str, detail: str):
-        self._status_label.setText(f"[{state}] {detail}" if detail else f"[{state}]")
+        rendered = f"[{state}] {detail}" if detail else f"[{state}]"
+        self._status_label.setText(rendered)
+        if self._output_recorder is not None:
+            self._output_recorder.event({
+                "type": "render",
+                "pane": "status",
+                "text": rendered,
+            })
 
     def _on_clear(self, target: str):
         if target in ("transcript", "all"):
             self._transcript_history = []
+            self._transcript_history_ids = []
             self._transcript_partial = {"mic": "", "loopback": ""}
+            self._transcript_partial_ids = {"mic": None, "loopback": None}
             self._transcript_view.append_and_scroll("")
+            if self._output_recorder is not None:
+                self._output_recorder.event({
+                    "type": "render",
+                    "pane": "transcript",
+                    "text": "",
+                    "clear": True,
+                })
         if target in ("answer", "all"):
             self._answer_text = ""
             self._answer_view.append_and_scroll("")
+            if self._output_recorder is not None:
+                self._output_recorder.event({
+                    "type": "render",
+                    "pane": "answer",
+                    "text": "",
+                    "clear": True,
+                })
 
     def closeEvent(self, event):  # noqa: N802
         self._receiver.stop()
         super().closeEvent(event)
+
+    def close_output_recorder(self):
+        """Flush the debug snapshot file when the GUI process really exits.
+
+        ``closeEvent`` is also used by the overlay's Hide action, so closing
+        the recorder there would make a later Show silently lose all records.
+        gui.app calls this from QApplication.aboutToQuit instead.
+        """
+        if self._output_recorder is not None:
+            self._output_recorder.close()

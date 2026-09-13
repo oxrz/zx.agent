@@ -22,7 +22,10 @@ audio:
   channels: 1
   block_duration: 0.5
   min_record_duration: 0.5
-  streaming_enabled: true        # keep sending new audio to the remote service, paired with the server's AlignAtt for low-latency incremental recognition
+  streaming_enabled: true        # keep sending new audio; rzp Zipformer produces low-latency partials
+  # The detailed cadence measurements below are historical notes from the retired
+  # SimulStreaming service. For the current rzp ASR POC, keep streaming_interval
+  # at 0.9 unless the client/server protocol is intentionally retuned together.
   # How often to send newly added audio, in seconds. Two constraints make this
   # value non-obvious, and both were measured (2026-08-20 baseline, 68s of audio;
   # the fix was then verified on a 162s run, 2026-08-21):

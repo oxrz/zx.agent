@@ -51,11 +51,13 @@ class DisplayPublisher:
         host: str = DEFAULT_HOST,
         port: int = DEFAULT_PORT,
         logger=None,
+        output_recorder=None,
     ):
         self.enabled = enabled
         self._host = host
         self._port = port
         self._logger = logger
+        self._output_recorder = output_recorder
         self._queue: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=_QUEUE_MAXSIZE)
         self._sock: Optional[socket.socket] = None
         self._running = False
@@ -115,6 +117,12 @@ class DisplayPublisher:
     def _enqueue(self, msg: Dict[str, Any]):
         if not self.enabled:
             return
+        if self._output_recorder is not None:
+            # Record the exact event stream before the asynchronous GUI socket
+            # queue can drop anything because the overlay is slow or reconnecting.
+            msg = dict(msg)
+            msg.setdefault("ts", time.time())
+            self._output_recorder.event(msg)
         try:
             self._queue.put_nowait(msg)
         except queue.Full:
@@ -124,9 +132,26 @@ class DisplayPublisher:
             except queue.Empty:
                 pass
 
+    def connect_now(self):
+        """Eagerly connect (call after verifying the GUI port is open)."""
+        if not self.enabled or self._sock is not None:
+            return
+        try:
+            sock = socket.create_connection((self._host, self._port), timeout=1.0)
+            self._sock = sock
+            self._last_connect_attempt = time.time()
+            self._log("info", f"Display frontend connected ({self._host}:{self._port})")
+        except OSError as e:
+            self._log("warning", f"Eager display connect failed: {e}")
+
     # ---- public API used by main.py ----
-    def transcript(self, text: str, source: str, is_final: bool):
-        self._enqueue(transcript_message(text, source, is_final))
+    def transcript(self, text: str, source: str, is_final: bool,
+                   pending_correction: bool = False, utterance_id=None,
+                   replace_utterance_id=None):
+        self._enqueue(transcript_message(
+            text, source, is_final, pending_correction,
+            utterance_id, replace_utterance_id,
+        ))
 
     def answer_chunk(self, text: str, done: bool = False):
         self._enqueue(answer_chunk_message(text, done))

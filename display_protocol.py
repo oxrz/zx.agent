@@ -6,9 +6,9 @@ Wire protocol: local TCP + newline-delimited JSON (JSON Lines / NDJSON), UTF-8
 encoded, one JSON object per line, terminated with "\n". This minimal format
 (instead of protobuf/gRPC) lets any language -- including a possible future Go
 rewrite of the agent core -- implement a sender in a few dozen lines using only
-the standard library, no codegen or extra dependencies required. This mirrors
-the "TCP + JSONL" convention already used by the remote STT service in this
-project (see audio/stt.py), so no new communication paradigm is introduced.
+the standard library, no codegen or extra dependencies required. This is an
+independent local display channel; the remote STT service uses WebSocket and
+binary PCM frames (see audio/stt.py).
 
 Roles:
   - The GUI process (gui/) is the TCP **server**: it only passively listens and
@@ -50,11 +50,23 @@ def encode_message(msg: Dict[str, Any]) -> bytes:
     return (json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8")
 
 
-def transcript_message(text: str, source: str, is_final: bool) -> Dict[str, Any]:
+def transcript_message(
+    text: str, source: str, is_final: bool, pending_correction: bool = False,
+    utterance_id: int | None = None, replace_utterance_id: int | None = None,
+) -> Dict[str, Any]:
     """Real-time transcript text. source: "mic" | "loopback"; is_final=False means
     a streaming partial result -- the GUI should overwrite the previous unconfirmed
-    line for the same source in place, not append to history."""
-    return {"type": "transcript", "source": source, "text": text, "is_final": is_final}
+    line for the same source in place, not append to history.
+    pending_correction=True: a Whisper final for an already-past utterance -- add to
+    history but do NOT clear the current in-progress partial for this source."""
+    msg: Dict[str, Any] = {"type": "transcript", "source": source, "text": text, "is_final": is_final}
+    if pending_correction:
+        msg["pending_correction"] = True
+    if utterance_id is not None:
+        msg["utterance_id"] = utterance_id
+    if replace_utterance_id is not None:
+        msg["replace_utterance_id"] = replace_utterance_id
+    return msg
 
 
 def answer_chunk_message(text: str, done: bool = False) -> Dict[str, Any]:

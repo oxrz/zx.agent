@@ -49,7 +49,7 @@ added automatically by the sender if not already present.
 Real-time transcription of one audio source.
 
 ```json
-{"type": "transcript", "source": "loopback", "text": "hello world", "is_final": false, "ts": 1234567890.123}
+{"type": "transcript", "source": "loopback", "text": "hello world", "is_final": false, "utterance_id": 7, "ts": 1234567890.123}
 ```
 
 - `source`: `"mic"` or `"loopback"`.
@@ -59,6 +59,14 @@ Real-time transcription of one audio source.
   previous partial for the same source. When `is_final: true`, this is the
   final confirmed text for that utterance.
 - `is_final`: whether this utterance has ended.
+- `utterance_id`: optional server-assigned ID for this utterance. The GUI uses it
+  to keep partials and finals belonging to the same sentence together.
+- `replace_utterance_id`: optional ID to replace in the rendered history. A late
+  Whisper correction sets this to the older Zipformer utterance ID; it must update
+  that line in place rather than append a duplicate.
+- `pending_correction`: optional boolean. When true, the final belongs to an older
+  utterance while a newer utterance is already streaming; the GUI must not clear
+  the newer utterance's partial line.
 
 ### `answer_chunk`
 
