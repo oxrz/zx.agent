@@ -22,8 +22,10 @@ from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 from display_protocol import DEFAULT_HOST, DEFAULT_PORT
 from gui.overlay import (
     OverlayWindow,
+    _DEFAULT_ANSWER_FONT_SIZE,
     _DEFAULT_HEIGHT,
     _DEFAULT_OPACITY,
+    _DEFAULT_TRANSCRIPT_FONT_SIZE,
     _DEFAULT_THEME,
     _DEFAULT_WIDTH,
     _THEMES,
@@ -147,6 +149,8 @@ def main():
     parser.add_argument("--height", type=int, default=_DEFAULT_HEIGHT, help=f"window height in pixels (default: {_DEFAULT_HEIGHT})")
     parser.add_argument("--opacity", type=int, default=_DEFAULT_OPACITY, help=f"background panel opacity, 0-255 (default: {_DEFAULT_OPACITY}); also adjustable live via the Settings window (right-click the overlay)")
     parser.add_argument("--theme", choices=sorted(_THEMES), default=_DEFAULT_THEME, help=f"color theme (default: {_DEFAULT_THEME}); also switchable live via the Settings window (right-click the overlay)")
+    parser.add_argument("--transcript-font-size", type=int, default=_DEFAULT_TRANSCRIPT_FONT_SIZE, help=f"transcript font size in points (default: {_DEFAULT_TRANSCRIPT_FONT_SIZE}); also adjustable live via Settings")
+    parser.add_argument("--answer-font-size", type=int, default=_DEFAULT_ANSWER_FONT_SIZE, help=f"answer font size in points (default: {_DEFAULT_ANSWER_FONT_SIZE}); also adjustable live via Settings")
     args = parser.parse_args()
 
     app = QApplication(sys.argv)
@@ -176,6 +180,8 @@ def main():
         height=args.height,
         opacity=args.opacity,
         theme=args.theme,
+        transcript_font_size=args.transcript_font_size,
+        answer_font_size=args.answer_font_size,
         output_path=os.environ.get("AGENTIC_GUI_OUTPUT_PATH"),
     )
     # Ensure the render-snapshot file is flushed when the process exits.  Do

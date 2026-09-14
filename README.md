@@ -180,6 +180,8 @@ Press `Ctrl+C` to shut down cleanly.
 - **ai**: `provider`/`model`/`api_base`/`api_key` (recommended to use `${AI_PROVIDER}` etc. from `.env`), temperature
 - **context**: assist mode's rolling context window (`window_minutes`, 20 minutes by default)
 - **tts**: enable/disable spoken output
+- **display**: GUI overlay size, opacity, theme, and initial font sizes
+  (`transcript_font_size` defaults to 12pt and `answer_font_size` to 13pt).
 
 ---
 

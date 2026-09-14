@@ -75,6 +75,8 @@ display:
                  # boot; binding inside one fails with WinError 10013. See display_protocol.py
   width: 900     # overlay window width in pixels
   height: 400    # overlay window height in pixels
-  opacity: 140    # background panel opacity, 0-255 (also adjustable live via the Settings window)
-  theme: "dark"   # "dark" (black background, white text) | "light" (white background, black text);
+  opacity: 200    # background panel opacity, 0-255 (also adjustable live via the Settings window)
+  theme: "light"  # "dark" (black background, white text) | "light" (white background, black text);
                   # also switchable live via the Settings window (right-click the overlay)
+  transcript_font_size: 12  # transcript font size in points
+  answer_font_size: 13      # answer font size in points
