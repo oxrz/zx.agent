@@ -44,7 +44,15 @@ Design notes:
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor, QFont, QKeySequence, QPainter, QShortcut, QTextCursor
+from PyQt6.QtGui import (
+    QColor,
+    QFont,
+    QFontMetrics,
+    QKeySequence,
+    QPainter,
+    QShortcut,
+    QTextCursor,
+)
 from PyQt6.QtWidgets import (
     QApplication,
     QHBoxLayout,
@@ -64,13 +72,17 @@ _DEFAULT_WIDTH = 900
 _DEFAULT_HEIGHT = 380
 _MIN_WIDTH = 320
 _MIN_HEIGHT = 160
+_DEFAULT_TRANSCRIPT_FONT_SIZE = 12
+_DEFAULT_ANSWER_FONT_SIZE = 13
+_MIN_FONT_SIZE = 8
+_MAX_FONT_SIZE = 48
 _RESIZE_MARGIN = 8  # pixels from each edge/corner that count as a resize handle
 _DRAG_STRIP_HEIGHT = 22  # roughly half a line to one line -- the only place
                           # (besides empty margin/gutter space) that reliably
                           # drags the window now that the text views are
                           # selectable instead of drag-passthrough
 
-_DEFAULT_OPACITY = 140    # 0-255, background panel alpha -- same range/meaning as the old _BG_ALPHA
+_DEFAULT_OPACITY = 200    # 0-255, background panel alpha -- same range/meaning as the old _BG_ALPHA
 _MIN_OPACITY = 20          # below this the panel is practically invisible, not useful
 _MAX_OPACITY = 255
 
@@ -95,13 +107,13 @@ _THEMES = {
         "answer": "#ffe38f",
     },
     "light": {
-        "bg": (245, 245, 245),
+        "bg": (255, 255, 255),
         "status": "#0a63c4",
         "transcript": "#111111",
         "answer": "#8a5200",
     },
 }
-_DEFAULT_THEME = "dark"
+_DEFAULT_THEME = "light"
 
 _TRANSPARENT_TEXTEDIT_STYLE = """
 QPlainTextEdit {{
@@ -195,12 +207,20 @@ class OverlayWindow(QWidget):
         height: int = _DEFAULT_HEIGHT,
         opacity: int = _DEFAULT_OPACITY,
         theme: str = _DEFAULT_THEME,
+        transcript_font_size: int = _DEFAULT_TRANSCRIPT_FONT_SIZE,
+        answer_font_size: int = _DEFAULT_ANSWER_FONT_SIZE,
         output_path: str | None = None,
     ):
         super().__init__()
         self._drag_offset = None
         self._opacity = min(max(opacity, _MIN_OPACITY), _MAX_OPACITY)
         self._theme = theme if theme in _THEMES else _DEFAULT_THEME
+        self._transcript_font_size = min(
+            max(int(transcript_font_size), _MIN_FONT_SIZE), _MAX_FONT_SIZE
+        )
+        self._answer_font_size = min(
+            max(int(answer_font_size), _MIN_FONT_SIZE), _MAX_FONT_SIZE
+        )
         self._settings_window = None
         # Edge-resize state: which edge(s) the cursor is currently over (a
         # subset of {"left", "right", "top", "bottom"}, empty = not on an
@@ -260,8 +280,12 @@ class OverlayWindow(QWidget):
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 4, 24, 16)
+        # Keep only a small panel edge around the text.  The bottom margin is
+        # adjusted below to exactly one transcript line after the configured
+        # transcript font is set.
+        layout.setContentsMargins(24, 4, 24, 4)
         layout.setSpacing(6)
+        self._layout = layout
 
         # Drag strip: the only reliable click-and-drag target now that the
         # text views below are selectable rather than drag-passthrough. The
@@ -277,10 +301,17 @@ class OverlayWindow(QWidget):
         drag_strip_layout.addStretch(1)
 
         self._transcript_view = _SelectableTextEdit()
-        self._transcript_view.setFont(QFont("Segoe UI", 14))
+        self._transcript_view.setFont(QFont("Segoe UI", self._transcript_font_size))
+        bottom_margin = QFontMetrics(self._transcript_view.font()).lineSpacing()
+        layout.setContentsMargins(24, 4, 24, bottom_margin)
 
         self._answer_view = _SelectableTextEdit()
-        self._answer_view.setFont(QFont("Segoe UI", 13))
+        self._answer_view.setFont(QFont("Segoe UI", self._answer_font_size))
+        # Most sessions are transcript-only.  Keeping an empty answer editor
+        # visible reserves its stretch area and makes roughly the lower third
+        # of the overlay look like unused margin.  Show it lazily when an
+        # answer actually starts streaming.
+        self._answer_view.hide()
 
         layout.addWidget(self._drag_strip)
         layout.addWidget(self._transcript_view, stretch=3)
@@ -360,6 +391,28 @@ class OverlayWindow(QWidget):
         self._opacity = min(max(int(opacity), _MIN_OPACITY), _MAX_OPACITY)
         self.update()  # repaint with the new alpha; text colors are unaffected
 
+    @staticmethod
+    def _set_point_size(widget, size: int):
+        font = widget.font()
+        font.setPointSize(int(size))
+        widget.setFont(font)
+
+    def set_transcript_font_size(self, size: int):
+        size = min(max(int(size), _MIN_FONT_SIZE), _MAX_FONT_SIZE)
+        self._transcript_font_size = size
+        self._set_point_size(self._transcript_view, size)
+        # Keep the requested one-line bottom breathing room in sync with the
+        # live font size rather than leaving a fixed pixel margin behind.
+        left, top, right, _ = self._layout.getContentsMargins()
+        bottom = QFontMetrics(self._transcript_view.font()).lineSpacing()
+        self._layout.setContentsMargins(left, top, right, bottom)
+        self._layout.activate()
+
+    def set_answer_font_size(self, size: int):
+        size = min(max(int(size), _MIN_FONT_SIZE), _MAX_FONT_SIZE)
+        self._answer_font_size = size
+        self._set_point_size(self._answer_view, size)
+
     @property
     def theme(self) -> str:
         return self._theme
@@ -367,6 +420,14 @@ class OverlayWindow(QWidget):
     @property
     def opacity(self) -> int:
         return self._opacity
+
+    @property
+    def transcript_font_size(self) -> int:
+        return self._transcript_view.font().pointSize()
+
+    @property
+    def answer_font_size(self) -> int:
+        return self._answer_view.font().pointSize()
 
     # ---- edge resize + drag to reposition (frameless window has no title bar) ----
     # This handles the empty margin/gutter area around the text views, and
@@ -544,6 +605,9 @@ class OverlayWindow(QWidget):
 
     def _on_answer_chunk(self, text: str, done: bool):
         if text:
+            if not self._answer_view.isVisible():
+                self._answer_view.show()
+                self._layout.activate()
             self._answer_text += text
             self._answer_view.append_and_scroll(self._answer_text)
         if self._output_recorder is not None:
@@ -581,6 +645,8 @@ class OverlayWindow(QWidget):
         if target in ("answer", "all"):
             self._answer_text = ""
             self._answer_view.append_and_scroll("")
+            self._answer_view.hide()
+            self._layout.activate()
             if self._output_recorder is not None:
                 self._output_recorder.event({
                     "type": "render",

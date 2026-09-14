@@ -1,10 +1,10 @@
 """
 SettingsWindow -- a small, normal (framed) Qt window for adjusting the
-overlay's live-adjustable appearance: background opacity and color theme
-(dark/light).
+overlay's live-adjustable appearance: background opacity, color theme
+(dark/light), and transcript/answer font sizes.
 
 Scope, deliberately narrow for now: this only touches OverlayWindow's own
-in-memory state (self._opacity / self._theme via set_opacity()/set_theme()).
+in-memory appearance state; it does not write configuration files.
 It does not read or write any config file, and it has no connection to the
 agent core process -- switching capture mode (transcribe/mic/assist) or any
 other agent-side setting is out of scope here, since that lives in a
@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QPushButton,
     QSlider,
+    QSpinBox,
     QVBoxLayout,
 )
 
@@ -65,6 +66,27 @@ class SettingsWindow(QDialog):
         self._theme_combo.currentIndexChanged.connect(self._on_theme_changed)
         layout.addWidget(self._theme_combo)
 
+        layout.addWidget(QLabel("Transcript font size"))
+        self._transcript_font_spin = QSpinBox()
+        from gui.overlay import _MAX_FONT_SIZE, _MIN_FONT_SIZE
+        self._transcript_font_spin.setRange(_MIN_FONT_SIZE, _MAX_FONT_SIZE)
+        self._transcript_font_spin.setSuffix(" pt")
+        self._transcript_font_spin.setValue(self._overlay.transcript_font_size)
+        self._transcript_font_spin.valueChanged.connect(
+            self._on_transcript_font_size_changed
+        )
+        layout.addWidget(self._transcript_font_spin)
+
+        layout.addWidget(QLabel("Answer font size"))
+        self._answer_font_spin = QSpinBox()
+        self._answer_font_spin.setRange(_MIN_FONT_SIZE, _MAX_FONT_SIZE)
+        self._answer_font_spin.setSuffix(" pt")
+        self._answer_font_spin.setValue(self._overlay.answer_font_size)
+        self._answer_font_spin.valueChanged.connect(
+            self._on_answer_font_size_changed
+        )
+        layout.addWidget(self._answer_font_spin)
+
         close_button = QPushButton("Close")
         close_button.clicked.connect(self.close)
         layout.addWidget(close_button)
@@ -76,3 +98,9 @@ class SettingsWindow(QDialog):
     def _on_theme_changed(self, index: int):
         theme = self._theme_combo.itemData(index)
         self._overlay.set_theme(theme)
+
+    def _on_transcript_font_size_changed(self, value: int):
+        self._overlay.set_transcript_font_size(value)
+
+    def _on_answer_font_size_changed(self, value: int):
+        self._overlay.set_answer_font_size(value)

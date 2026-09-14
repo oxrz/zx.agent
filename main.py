@@ -348,8 +348,11 @@ class ZxAgent:
             height = display_config.get("height")
             opacity = display_config.get("opacity")
             theme = display_config.get("theme")
+            transcript_font_size = display_config.get("transcript_font_size")
+            answer_font_size = display_config.get("answer_font_size")
             self._gui_process = self._maybe_launch_gui(
-                host, port, width, height, opacity, theme, self._gui_output_path
+                host, port, width, height, opacity, theme,
+                transcript_font_size, answer_font_size, self._gui_output_path
             )
             if self._gui_process is not None:
                 self._wait_for_gui_ready(host, port)
@@ -365,7 +368,8 @@ class ZxAgent:
             self.display.connect_now()
 
     def _maybe_launch_gui(self, host, port, width=None, height=None, opacity=None,
-                          theme=None, output_path=None):
+                          theme=None, transcript_font_size=None,
+                          answer_font_size=None, output_path=None):
         """Launch `python -m gui.app` as a child process, unless something is
         already listening on host:port (e.g. the user started the GUI manually
         in another terminal -- don't spawn a second, redundant overlay window).
@@ -373,7 +377,7 @@ class ZxAgent:
         never imports anything from gui/ or PyQt directly -- it just shells out
         to a separate `python -m gui.app` process, same as running it by hand.
 
-        width/height/opacity/theme (optional, from config.display.*) are
+        width/height/opacity/theme/font sizes (optional, from config.display.*) are
         forwarded as the matching --flag so the auto-launched window starts
         with whatever was configured, instead of always falling back to
         gui.app's built-in defaults. All four are also adjustable live from
@@ -397,6 +401,10 @@ class ZxAgent:
             cmd += ["--opacity", str(opacity)]
         if theme:
             cmd += ["--theme", str(theme)]
+        if transcript_font_size is not None:
+            cmd += ["--transcript-font-size", str(transcript_font_size)]
+        if answer_font_size is not None:
+            cmd += ["--answer-font-size", str(answer_font_size)]
 
         env = dict(os.environ)
         env[_GUI_LAUNCH_TOKEN_ENV] = "1"
